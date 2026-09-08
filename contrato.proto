@@ -1,0 +1,107 @@
+// Contrato de servicio — App Java <-> App Python
+// Versión 2.2. Ver CONTRATO.md para las reglas que el .proto no puede expresar
+// (validación, orden de los chequeos, semántica de los errores).
+//
+// Generar los stubs:
+//   Python: python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. contrato.proto
+//   Java:   protoc -I. --java_out=. --grpc-java_out=. contrato.proto
+
+syntax = "proto3";
+
+package sdypp;
+
+option java_package = "ar.edu.unlu.sdypp.contrato";
+option java_multiple_files = true;
+
+// El servicio completo. Las dos implementaciones exponen estos cinco métodos con
+// estas mismas firmas: son intercambiables detrás del balanceador.
+service Servicio {
+  // Identidad de la instancia. Reemplaza a GET /
+  rpc Identidad(IdentidadPedido) returns (Instancia);
+
+  // Chequeo de salud. Reemplaza a GET /health
+  rpc Salud(SaludPedido) returns (EstadoSalud);
+
+  // Reemplaza a POST /echo
+  rpc Echo(PingPedido) returns (PongRespuesta);
+
+  // Reemplaza a GET /personas
+  rpc ListarPersonas(ListarPersonasPedido) returns (ListaPersonas);
+
+  // Reemplaza a POST /personas
+  rpc CrearPersona(NuevaPersona) returns (RespuestaPersona);
+}
+
+// Un mensaje de pedido propio por método, aunque hoy los tres estén vacíos. Si se
+// compartiera uno solo, el día que ListarPersonas necesite un filtro o paginación
+// el campo nuevo aparecería también en Identidad y en Salud.
+message IdentidadPedido {}
+
+message SaludPedido {}
+
+message ListarPersonasPedido {}
+
+// Un integrante del equipo. El legajo es un campo propio, no un dato embutido en
+// el nombre: acá el tipo lo hace imposible de otra forma.
+message Integrante {
+  string nombre = 1;
+  string apellido = 2;
+  int32 legajo = 3;
+}
+
+message Instancia {
+  string app = 1;        // "python" o "java"
+  string lenguaje = 2;   // texto libre, informativo
+  repeated Integrante equipo = 3;
+  int32 version = 4;
+  string mensaje = 5;    // texto plano
+  string host = 6;       // variable de entorno HOST_NAME
+  string arrancado = 7;  // ISO-8601 con offset, precisión de segundos
+}
+
+message EstadoSalud {
+  // Enumerado y no string: con texto libre una implementación puede mandar "ok" y
+  // la otra "OK", que es justo la clase de divergencia que este contrato evita.
+  // El valor 0 es obligatorio en proto3 y es el que llega si el campo no se manda.
+  enum Estado {
+    ESTADO_NO_ESPECIFICADO = 0;
+    SANO = 1;
+  }
+
+  Estado status = 1;
+  string app = 2;
+  int32 version = 3;
+}
+
+message PingPedido {
+  string ping = 1;
+}
+
+message PongRespuesta {
+  string pong = 1;
+  string servido_por = 2;
+  int32 version = 3;
+}
+
+// El id lo asigna la base, nunca la app. En CrearPersona el cliente no lo manda:
+// por eso NuevaPersona es un mensaje aparte y no reusa Persona.
+message Persona {
+  int32 id = 1;
+  string nombre = 2;
+  int32 legajo = 3;
+}
+
+message NuevaPersona {
+  string nombre = 1;
+  int32 legajo = 2;
+}
+
+message RespuestaPersona {
+  string servido_por = 1;
+  Persona persona = 2;
+}
+
+message ListaPersonas {
+  string servido_por = 1;
+  repeated Persona personas = 2;  // ordenadas por id ascendente
+}

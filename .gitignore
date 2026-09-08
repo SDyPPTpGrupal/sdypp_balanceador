@@ -1,0 +1,16 @@
+# Entorno virtual
+.venv/
+__pycache__/
+*.pyc
+
+# Stubs generados desde contrato.proto: se regeneran, no se versionan.
+app/contrato_pb2*.py
+
+# Bitácoras
+logs/
+*.log
+
+# Configuración por nodo: puede llevar IPs y credenciales.
+.env
+.env.*
+!.env.example
