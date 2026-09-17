@@ -26,7 +26,7 @@ RUN useradd --create-home --uid 1000 balanceador
 
 COPY --from=builder /instalado /usr/local
 COPY --from=builder /build/contrato_pb2.py /build/contrato_pb2_grpc.py ./
-COPY app/balanceador.py ./
+COPY app/balanceador.py app/cola.py ./
 
 RUN mkdir -p /app/logs && chown -R balanceador:balanceador /app
 USER balanceador

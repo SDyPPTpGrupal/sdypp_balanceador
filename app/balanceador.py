@@ -29,6 +29,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import contrato_pb2 as pb
 import contrato_pb2_grpc as pb_grpc
+from cola import Cola, Pedido, Worker
 
 # --- Configuración ---------------------------------------------------------
 # Todo por entorno: la topología se decide el día de la demo sin tocar código.
@@ -52,8 +53,17 @@ INTERVALO_SALUD = float(os.environ.get("BA_INTERVALO_SALUD", "3"))
 FALLOS_PARA_SACAR = int(os.environ.get("BA_FALLOS_PARA_SACAR", "2"))
 EXITOS_PARA_VOLVER = int(os.environ.get("BA_EXITOS_PARA_VOLVER", "1"))
 
-TIMEOUT_RPC = float(os.environ.get("BA_TIMEOUT_RPC", "5"))
+# Presupuesto total de un pedido, espera en cola incluida. Un solo número y no
+# "timeout de cola + timeout de RPC": lo que le importa al cliente es cuánto
+# tarda la respuesta, no en qué parte del camino se fue el tiempo.
+PRESUPUESTO = float(os.environ.get("BA_TIMEOUT_RPC", "5"))
 TIMEOUT_SALUD = float(os.environ.get("BA_TIMEOUT_SALUD", "2"))
+
+# La cola: cuántos pedidos pueden esperar (pasado eso, 503 en el acto) y
+# cuántos hilos worker atienden cada réplica, que es lo mismo que decir cuántos
+# pedidos en vuelo puede tener cada una.
+COTA_COLA = int(os.environ.get("BA_COTA_COLA", "100"))
+WORKERS_POR_REPLICA = int(os.environ.get("BA_WORKERS_POR_REPLICA", "4"))
 
 # --- El plano de control, separado del plano de datos -----------------------
 # /admin/backends decide a dónde va TODO el tráfico del servicio: quien lo toca
@@ -107,7 +117,7 @@ def bitacora(operacion, codigo, destino=None, detalle=None):
 # --- El pool ---------------------------------------------------------------
 
 class Backend:
-    """Una réplica. Mantiene el canal gRPC abierto y su estado de salud."""
+    """Una réplica. Mantiene el canal gRPC abierto, su estado de salud y sus workers."""
 
     def __init__(self, destino, app="python"):
         self.destino = destino
@@ -122,6 +132,31 @@ class Backend:
         self.canal = grpc.insecure_channel(destino)
         self.stub = pb_grpc.ServicioStub(self.canal)
         self.stub_salud = health_pb2_grpc.HealthStub(self.canal)
+        # Los hilos que le hablan a esta réplica. Los contadores que muestra
+        # /health (en vuelo, atendidos) se suman de acá: cada worker escribe
+        # sólo los suyos, así nadie comparte un contador entre hilos.
+        self.workers = []
+        self._vivos = 0
+        self._lock = threading.Lock()
+
+    def atar(self, worker):
+        with self._lock:
+            self.workers.append(worker)
+            self._vivos += 1
+        worker.start()
+
+    def soltar(self, worker):
+        """Un worker se fue. El último que sale cierra el canal.
+
+        Mientras quede otro, puede tener un RPC en vuelo sobre esa misma
+        conexión: cerrarla antes le cortaría la respuesta a un cliente, justo
+        durante el cambio de versión, que es cuando se quita una réplica.
+        """
+        with self._lock:
+            self._vivos -= 1
+            ultimo = self._vivos <= 0
+        if ultimo:
+            self.cerrar()
 
     def chequear(self):
         """Le pregunta por grpc.health.v1.Health. Devuelve si cambió de estado."""
@@ -136,21 +171,29 @@ class Backend:
         return self._registrar(vivo)
 
     def _registrar(self, vivo):
-        antes = self.sano
-        if vivo:
-            self.fallos = 0
-            self.exitos += 1
-            if not self.sano and self.exitos >= EXITOS_PARA_VOLVER:
-                self.sano = True
-        else:
-            self.exitos = 0
-            self.fallos += 1
-            if self.sano and self.fallos >= FALLOS_PARA_SACAR:
-                self.sano = False
-        return antes != self.sano
+        # Con candado porque ahora lo alimentan dos: el vigilante y los workers
+        # que se encuentran con la réplica caída en medio de un pedido.
+        with self._lock:
+            antes = self.sano
+            if vivo:
+                self.fallos = 0
+                self.exitos += 1
+                if not self.sano and self.exitos >= EXITOS_PARA_VOLVER:
+                    self.sano = True
+            else:
+                self.exitos = 0
+                self.fallos += 1
+                if self.sano and self.fallos >= FALLOS_PARA_SACAR:
+                    self.sano = False
+            return antes != self.sano
 
     def cerrar(self):
         self.canal.close()
+
+    def estado_worker(self):
+        """Los N workers resumidos en uno: si alguno está ocupado, está ocupada."""
+        estados = {w.estado for w in self.workers}
+        return next((e for e in Worker.ESTADOS if e in estados), None)
 
     def como_json(self):
         return {
@@ -159,71 +202,69 @@ class Backend:
             "sano": self.sano,
             "fallos": self.fallos,
             "ultimoChequeo": self.visto,
+            "worker": self.estado_worker(),
+            "enVuelo": sum(1 for w in self.workers if w.estado == "ocupado"),
+            "atendidos": sum(w.atendidos for w in self.workers),
         }
 
 
 class Pool:
-    """La lista de backends y el turno del round-robin.
+    """La lista de backends. Ya no reparte: cada réplica tiene workers que
+    sacan de la cola cuando pueden, y el reparto sale solo de eso.
 
-    El contador del round-robin es un dato compartido entre los threads que
-    atienden requests: sin candado, dos threads leen el mismo valor y las dos
-    requests van al mismo backend (y el siguiente se saltea). Es una race
-    condition de manual — el mismo problema de exclusión mutua de la materia,
-    pero dentro de un proceso.
+    Sigue habiendo un candado, pero ahora protege el dict: agregar y quitar
+    réplicas pasa por el plano de control mientras los workers preguntan
+    `tiene()` todo el tiempo.
     """
 
-    def __init__(self):
+    def __init__(self, cola):
         self._lock = threading.Lock()
         self._backends = {}
-        self._turno = 0
+        self._cola = cola
 
     def agregar(self, destino, app="python"):
         """Devuelve el backend recién creado, o None si el destino ya estaba.
 
         Devuelve el objeto y no un booleano para que quien lo agrega pueda
         chequearlo en el acto, sin esperar al próximo ciclo del vigilante.
+        Arranca sus workers: hasta que el chequeo lo dé por sano, duermen.
         """
         with self._lock:
             if destino in self._backends:
                 return None
             backend = Backend(destino, app)
             self._backends[destino] = backend
-            return backend
+        for n in range(1, WORKERS_POR_REPLICA + 1):
+            backend.atar(Worker(backend, self._cola, self, n))
+        return backend
 
     def quitar(self, destino):
+        """Sólo lo saca de la lista. No cierra nada: sus workers ven que ya no
+        está, terminan lo que tienen en vuelo y el último cierra el canal."""
         with self._lock:
-            b = self._backends.pop(destino, None)
-        if b:
-            b.cerrar()
-        return b is not None
+            return self._backends.pop(destino, None) is not None
+
+    def tiene(self, backend):
+        """¿Este objeto sigue en el pool? Por identidad, no por destino: si se
+        quita y se vuelve a agregar el mismo destino, es otro Backend con otros
+        workers, y los viejos tienen que irse."""
+        with self._lock:
+            return self._backends.get(backend.destino) is backend
+
+    def fallo(self, backend):
+        """Un worker no pudo ni conectarse. Es el mismo contador que usa el
+        vigilante: la caída que detecta un pedido y la que detecta el chequeo
+        periódico son la misma cosa, sólo que una llega antes."""
+        if backend._registrar(False):
+            bitacora("salud", "CAMBIO", backend.destino, "sale de rotación (falló una request)")
 
     def todos(self):
         with self._lock:
             return list(self._backends.values())
 
-    def orden_de_intento(self):
-        """Los sanos, empezando por el que le toca. El resto queda de respaldo.
 
-        Devuelve la lista entera y no un solo backend porque si el primero falla
-        queremos reintentar en el siguiente sin volver a pedir turno: pedir turno
-        de nuevo saltearía una réplica del reparto.
-        """
-        with self._lock:
-            sanos = [b for b in self._backends.values() if b.sano]
-            # Último recurso: si no hay ninguno sano, devolvemos los caídos igual.
-            # Entre dos chequeos hay una ventana en la que una réplica puede haber
-            # revivido y nosotros todavía no saberlo; rendirse con un 503 sin
-            # siquiera intentarlo es peor que gastar un intento. Si de verdad
-            # están todas muertas, el 503 sale igual, sólo que unos ms más tarde.
-            candidatos = sanos or list(self._backends.values())
-            if not candidatos:
-                return []
-            arranque = self._turno % len(candidatos)
-            self._turno = (self._turno + 1) % len(candidatos)
-            return candidatos[arranque:] + candidatos[:arranque]
-
-
-POOL = Pool()
+COLA = Cola(COTA_COLA)
+POOL = Pool(COLA)
 
 
 def vigilar_salud():
@@ -231,7 +272,7 @@ def vigilar_salud():
 
     Preguntando y no esperando a que una request falle: si esperáramos al fallo,
     cada muerte le costaría un error a un usuario real. Igual reaccionamos al
-    fallo también (ver derivar), porque entre dos chequeos hay una ventana.
+    fallo también (ver Worker.atender), porque entre dos chequeos hay una ventana.
     """
     while True:
         for b in POOL.todos():
@@ -258,45 +299,53 @@ CODIGOS = {
     grpc.StatusCode.UNIMPLEMENTED: 501,
 }
 
-# Un error de estos significa que la réplica ni miró el pedido: la conexión no se
-# pudo abrir. Reintentar en otra es seguro porque no hay nada hecho a medias.
-# Un INVALID_ARGUMENT, en cambio, va a dar igual en todas: reintentarlo sería
-# repetir el mismo error N veces y multiplicar la latencia del error.
-REINTENTABLES = (grpc.StatusCode.UNAVAILABLE,)
-
-
 def persona_json(p):
     return {"id": p.id, "nombre": p.nombre, "legajo": p.legajo}
 
 
-def derivar(operacion, llamar):
-    """Elige un backend, ejecuta el RPC y reintenta en otro si no atendió.
+def _destino(pedido):
+    return pedido.intentos[-1] if pedido.intentos else None
 
-    `llamar` recibe el stub y devuelve la respuesta del RPC.
-    Devuelve (codigo_http, cuerpo, destino, detalle).
+
+def _camino(pedido):
+    """`intentos=a→b ` cuando pasó por más de una réplica: la evidencia de la
+    reasignación, en la misma línea de bitácora que el resultado."""
+    return f"intentos={'→'.join(pedido.intentos)} " if len(pedido.intentos) > 1 else ""
+
+
+def derivar(operacion, llamar, idempotente=True, cliente=None):
+    """Encola el pedido y espera a que un worker lo atienda.
+
+    `llamar(stub, timeout, metadata)` hace el RPC contra el stub que le den:
+    quién lo atiende lo decide el worker que lo saque, no este hilo. La regla
+    de reintento vive en Worker.atender; acá sólo se espera el resultado.
+
+    Devuelve (codigo_http, cuerpo, destino, detalle). codigo_http es None si
+    salió bien y `cuerpo` es la respuesta del RPC.
     """
-    candidatos = POOL.orden_de_intento()
-    if not candidatos:
-        return 503, {"error": "no hay réplicas sanas en rotación"}, None, "pool vacío"
+    if not POOL.todos():
+        # Sin réplicas no hay worker que vaya a sacar nada: esperar el
+        # presupuesto entero para contestar 504 sería mentirle al cliente.
+        return 503, {"error": "no hay réplicas en el pool"}, None, "pool vacío"
 
-    ultimo = None
-    for backend in candidatos:
-        try:
-            return (None, llamar(backend.stub), backend.destino, None)
-        except grpc.RpcError as e:
-            codigo = e.code()
-            ultimo = (codigo, e.details(), backend.destino)
-            if codigo in REINTENTABLES:
-                # La réplica no contestó: la sacamos ya, sin esperar al próximo
-                # chequeo, y seguimos con la siguiente. El usuario no se entera.
-                if backend._registrar(False):
-                    bitacora("salud", "CAMBIO", backend.destino, "sale de rotación (falló una request)")
-                continue
-            return (CODIGOS.get(codigo, 500), {"error": e.details()}, backend.destino, str(codigo.name))
+    pedido = Pedido(operacion, llamar, idempotente,
+                    vence_en=time.monotonic() + PRESUPUESTO, cliente=cliente)
+    req = f"req={pedido.request_id}"
+    if not COLA.put(pedido):
+        return (503, {"error": "cola llena"}, None,
+                f"cola llena ({COLA.largo()}/{COLA.cota}) {req}")
 
-    codigo, detalle, destino = ultimo
-    return (CODIGOS.get(codigo, 503), {"error": detalle or "sin réplicas que respondan"},
-            destino, f"{codigo.name} en las {len(candidatos)} réplicas")
+    if not pedido.listo.wait(timeout=max(pedido.queda(), 0)):
+        # Nadie lo atendió a tiempo: todas caídas o todas lentas. El pedido
+        # queda en la cola; el worker que lo saque lo va a descartar sin RPC.
+        return (504, {"error": "sin respuesta a tiempo"}, _destino(pedido),
+                f"venció {_camino(pedido)}{req}")
+
+    codigo, r = pedido.resultado
+    if codigo == grpc.StatusCode.OK:
+        return None, r, _destino(pedido), f"{_camino(pedido)}{req}"
+    return (CODIGOS.get(codigo, 500), {"error": r}, _destino(pedido),
+            f"{codigo.name} {_camino(pedido)}{req}")
 
 
 # --- El servidor HTTP ------------------------------------------------------
@@ -339,9 +388,14 @@ class Manejador(BaseHTTPRequestHandler):
 
     # -- el contrato público --
 
+    # Los lambda no eligen réplica: reciben el stub, el tiempo que queda y la
+    # metadata del worker que los saque de la cola. El cliente viaja como
+    # x-forwarded-for para que la réplica sepa quién pidió de verdad.
+
     def identidad(self):
-        codigo, r, destino, detalle = derivar("GET /", lambda s: s.Identidad(
-            pb.IdentidadPedido(), timeout=TIMEOUT_RPC))
+        codigo, r, destino, detalle = derivar("GET /", lambda s, timeout, metadata: s.Identidad(
+            pb.IdentidadPedido(), timeout=timeout, metadata=metadata),
+            cliente=self.client_address[0])
         if codigo:
             return self.paso("GET /", codigo, r, destino, detalle)
         self.paso("GET /", 200, {
@@ -354,7 +408,7 @@ class Manejador(BaseHTTPRequestHandler):
             "host": r.host,
             "arrancado": r.arrancado,
             "servidoPor": r.app,
-        }, destino, f"host={r.host}")
+        }, destino, f"host={r.host} {detalle}")
 
     def salud(self):
         """La salud del balanceador, no la de una réplica.
@@ -378,22 +432,24 @@ class Manejador(BaseHTTPRequestHandler):
         cuerpo = self.cuerpo_json()
         if cuerpo is None:
             return self.paso("POST /echo", 400, {"error": "cuerpo no es JSON"}, None, None)
-        codigo, r, destino, detalle = derivar("POST /echo", lambda s: s.Echo(
-            pb.PingPedido(ping=str(cuerpo.get("ping", ""))), timeout=TIMEOUT_RPC))
+        codigo, r, destino, detalle = derivar("POST /echo", lambda s, timeout, metadata: s.Echo(
+            pb.PingPedido(ping=str(cuerpo.get("ping", ""))), timeout=timeout, metadata=metadata),
+            cliente=self.client_address[0])
         if codigo:
             return self.paso("POST /echo", codigo, r, destino, detalle)
         self.paso("POST /echo", 200,
                   {"pong": r.pong, "servidoPor": r.servido_por, "version": r.version},
-                  destino, None)
+                  destino, detalle)
 
     def listar(self):
-        codigo, r, destino, detalle = derivar("GET /personas", lambda s: s.ListarPersonas(
-            pb.ListarPersonasPedido(), timeout=TIMEOUT_RPC))
+        codigo, r, destino, detalle = derivar("GET /personas", lambda s, timeout, metadata: s.ListarPersonas(
+            pb.ListarPersonasPedido(), timeout=timeout, metadata=metadata),
+            cliente=self.client_address[0])
         if codigo:
             return self.paso("GET /personas", codigo, r, destino, detalle)
         self.paso("GET /personas", 200,
                   {"servidoPor": r.servido_por, "personas": [persona_json(p) for p in r.personas]},
-                  destino, f"n={len(r.personas)}")
+                  destino, f"n={len(r.personas)} {detalle}")
 
     def crear(self):
         cuerpo = self.cuerpo_json()
@@ -406,14 +462,17 @@ class Manejador(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return self.paso("POST /personas", 400,
                              {"error": "legajo tiene que ser un entero"}, None, None)
-        codigo, r, destino, detalle = derivar("POST /personas", lambda s: s.CrearPersona(
+        # La única escritura: idempotente=False. Si la réplica no contestó a
+        # tiempo no sabemos si la creó, y repetirla puede duplicar la persona.
+        codigo, r, destino, detalle = derivar("POST /personas", lambda s, timeout, metadata: s.CrearPersona(
             pb.NuevaPersona(nombre=str(cuerpo.get("nombre", "")), legajo=legajo),
-            timeout=TIMEOUT_RPC))
+            timeout=timeout, metadata=metadata),
+            idempotente=False, cliente=self.client_address[0])
         if codigo:
             return self.paso("POST /personas", codigo, r, destino, detalle)
         self.paso("POST /personas", 201,
                   {"servidoPor": r.servido_por, "persona": persona_json(r.persona)},
-                  destino, f"id={r.persona.id}")
+                  destino, f"id={r.persona.id} {detalle}")
 
     # -- el endpoint privado que usa el deploy.sh de cada casa --
 
