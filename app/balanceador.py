@@ -58,12 +58,12 @@ TIMEOUT_SALUD = float(os.environ.get("BA_TIMEOUT_SALUD", "2"))
 # --- El plano de control, separado del plano de datos -----------------------
 # /admin/backends decide a dónde va TODO el tráfico del servicio: quien lo toca
 # manda el tráfico a donde quiera. Por eso no vive en el puerto público sino en
-# un socket propio, y ese socket escucha por defecto sólo en loopback: el CI/CD
-# corre en la misma máquina que el balanceador, así que no necesita salir a la
-# red para conmutar. Lo que no escucha en la red no se puede atacar desde la red.
+# un socket propio, y ese socket escucha por defecto sólo en loopback: lo que no
+# escucha en la red no se puede atacar desde la red.
 #
-# Si algún día el CI/CD se muda a otra casa, se abre con BA_ADMIN_BIND y se
-# restringe con BA_ADMIN_IPS. Las dos cosas, no una.
+# Ese default no alcanza para la demo. Cada casa corre su propio deploy.sh y
+# avisa desde su máquina, así que hay que abrirlo: BA_ADMIN_BIND lo hace
+# alcanzable y BA_ADMIN_IPS decide quién entra. Las dos cosas, no una.
 PUERTO_ADMIN = int(os.environ.get("BA_PUERTO_ADMIN", "8081"))
 ADMIN_BIND = os.environ.get("BA_ADMIN_BIND", "127.0.0.1")
 
@@ -415,7 +415,7 @@ class Manejador(BaseHTTPRequestHandler):
                   {"servidoPor": r.servido_por, "persona": persona_json(r.persona)},
                   destino, f"id={r.persona.id}")
 
-    # -- el endpoint privado que usa el CI/CD --
+    # -- el endpoint privado que usa el deploy.sh de cada casa --
 
     def admin_leer(self):
         if not self.admin_permitido():
@@ -499,7 +499,7 @@ class ManejadorPublico(Manejador):
 
 
 class ManejadorAdmin(Manejador):
-    """El plano de control. Sólo lo alcanza el CI/CD."""
+    """El plano de control. Sólo lo alcanzan los deploy.sh de las casas."""
 
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/") == "/admin/backends":
@@ -513,9 +513,16 @@ class ManejadorAdmin(Manejador):
 
 
 def main():
-    for destino in (x.strip() for x in BACKENDS_INICIALES.split(",")):
-        if destino:
-            POOL.agregar(destino)
+    # "host:puerto" o "host:puerto=java". Sin la etiqueta se asume python, que es
+    # como venía. Hace falta poder decirlo porque tras un reinicio el pool se
+    # rearma desde acá: una réplica Java que vuelve etiquetada python miente en
+    # /health y en la auditoría justo cuando hay que mostrar que reparte entre
+    # los dos lenguajes.
+    for entrada in (x.strip() for x in BACKENDS_INICIALES.split(",")):
+        if not entrada:
+            continue
+        destino, _, app = entrada.partition("=")
+        POOL.agregar(destino.strip(), app.strip() or "python")
 
     threading.Thread(target=vigilar_salud, daemon=True).start()
 

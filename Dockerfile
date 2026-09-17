@@ -37,8 +37,9 @@ ENV BA_PUERTO=8080 \
     BA_LOGS=/app/logs \
     PYTHONUNBUFFERED=1
 
-# Sólo se publica el puerto público. El de administración escucha en loopback y
-# no se expone: el CI/CD lo alcanza porque comparte la red del host.
+# Sólo se publica el puerto público. El de administración escucha en loopback por
+# defecto; para que las casas conmuten desde afuera hay que abrirlo con
+# BA_ADMIN_BIND, restringirlo con BA_ADMIN_IPS y correr con --network host.
 EXPOSE 8080
 
 # Se chequea a sí mismo: 200 mientras tenga al menos una réplica en rotación.
