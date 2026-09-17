@@ -16,6 +16,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
 
+import grpc
+
 
 @dataclass
 class Pedido:
@@ -101,3 +103,97 @@ class Cola:
     def largo(self):
         with self._hay:
             return len(self._pedidos)
+
+
+class Worker(threading.Thread):
+    """Un hilo atado a una réplica: saca de la cola y le habla sólo a ella.
+
+    Es el modelo de consumidores que compiten: nadie reparte, cada worker saca
+    cuando puede. Una réplica lenta saca menos; una caída no saca nada, porque
+    su worker duerme mientras `backend.sano` sea False. Así el reparto sale
+    solo de la velocidad de cada una, sin round-robin ni contador compartido.
+
+    Necesita del backend: `destino`, `sano`, `stub`, `soltar(worker)`. Del pool:
+    `tiene(backend)`, `fallo(backend)`. Nada más, así se prueba con falsos.
+    """
+
+    # Prioridad al resumir los N workers de una réplica en un solo estado para
+    # /health: si uno está ocupado, la réplica está ocupada.
+    ESTADOS = ("ocupado", "libre", "durmiendo", "terminando")
+
+    def __init__(self, backend, cola, pool, numero=1):
+        super().__init__(name=f"worker-{backend.destino}-{numero}", daemon=True)
+        self.backend = backend
+        self.cola = cola
+        self.pool = pool
+        self.estado = "durmiendo"
+        self.atendidos = 0
+
+    def run(self):
+        b = self.backend
+        try:
+            while self.pool.tiene(b):
+                if not b.sano:
+                    self.estado = "durmiendo"
+                    time.sleep(Cola.ESPERA)
+                    continue
+                self.estado = "libre"
+                pedido = self.cola.get(lambda: b.sano and self.pool.tiene(b))
+                if pedido is None:
+                    continue
+                self.estado = "ocupado"
+                self.atender(pedido)
+        finally:
+            # Sacado del pool: terminamos lo que teníamos en vuelo y nos vamos.
+            # El canal lo cierra el backend cuando se va el último de sus workers.
+            self.estado = "terminando"
+            b.soltar(self)
+
+    def atender(self, pedido):
+        """Un intento contra nuestra réplica. Termina el pedido o lo devuelve."""
+        b = self.backend
+        if pedido.queda() <= 0:
+            # Venció esperando en la cola. No gastamos un RPC en algo que el
+            # handler ya no va a leer.
+            self.terminar(pedido, grpc.StatusCode.DEADLINE_EXCEEDED, "venció esperando en la cola")
+            return
+
+        pedido.intentos.append(b.destino)
+        # El mismo id en cada intento: es lo que permite seguir un pedido
+        # reasignado por las bitácoras de dos casas.
+        metadata = [("x-request-id", pedido.request_id)]
+        if pedido.cliente:
+            metadata.append(("x-forwarded-for", pedido.cliente))
+        try:
+            respuesta = pedido.llamar(b.stub, timeout=pedido.queda(), metadata=metadata)
+        except grpc.RpcError as e:
+            codigo, detalle = e.code(), e.details()
+        except Exception as e:  # un bug en `llamar` no puede dejar al handler esperando
+            self.terminar(pedido, grpc.StatusCode.INTERNAL, f"{type(e).__name__}: {e}")
+            return
+        else:
+            self.atendidos += 1
+            self.terminar(pedido, grpc.StatusCode.OK, respuesta)
+            return
+
+        # La regla de reintento. Es contrato, no detalle: ver el README.
+        if codigo == grpc.StatusCode.UNAVAILABLE:
+            # La réplica ni miró el pedido: no hay nada hecho a medias.
+            # Reintentar es gratis, y la marcamos caída sin esperar al vigilante.
+            self.pool.fallo(b)
+            self.cola.devolver_al_frente(pedido)
+        elif codigo == grpc.StatusCode.DEADLINE_EXCEEDED and pedido.idempotente and pedido.queda() > 0:
+            # Una lectura que tardó demasiado se puede repetir en otra. Una
+            # escritura NO: "tardó demasiado" no dice si se ejecutó o no, y
+            # repetirla puede crear la persona dos veces. Preferimos un 504
+            # honesto a un duplicado silencioso.
+            self.cola.devolver_al_frente(pedido)
+        else:
+            # INVALID_ARGUMENT, ALREADY_EXISTS, ... van a dar igual en cualquier
+            # réplica: reintentar sería repetir el mismo error N veces.
+            self.terminar(pedido, codigo, detalle)
+
+    @staticmethod
+    def terminar(pedido, codigo, respuesta=None):
+        pedido.resultado = (codigo, respuesta)
+        pedido.listo.set()
