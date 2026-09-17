@@ -3,7 +3,9 @@
 
 Es la única URL pública del servicio. Recibe HTTP/JSON (el contrato del
 enunciado: GET /, GET /health, POST /echo, GET /personas, POST /personas),
-elige una réplica del pool y le hace el RPC correspondiente de contrato.proto.
+encola cada pedido y un worker por réplica le hace el RPC correspondiente de
+contrato.proto (ver cola.py). No elige réplica: la que tiene un worker libre
+saca el pedido, y si no lo pudo atender lo devuelve para que lo saque otra.
 
     python3 app/balanceador.py
 
@@ -39,7 +41,7 @@ CASA = os.environ.get("BA_CASA", "casa-tomas")
 NOMBRE = os.environ.get("BA_NOMBRE", "balanceador")
 
 # Backends iniciales, separados por coma: "salvador:8080,mateon:8080".
-# Puede quedar vacío: el deploy.sh los va cargando por /admin/backends.
+# Puede quedar vacío: el CD los va cargando por /admin/backends.
 BACKENDS_INICIALES = os.environ.get("BA_BACKENDS", "")
 
 DIRECTORIO_LOGS = os.environ.get("BA_LOGS", "logs")
@@ -71,9 +73,10 @@ WORKERS_POR_REPLICA = int(os.environ.get("BA_WORKERS_POR_REPLICA", "4"))
 # un socket propio, y ese socket escucha por defecto sólo en loopback: lo que no
 # escucha en la red no se puede atacar desde la red.
 #
-# Ese default no alcanza para la demo. Cada casa corre su propio deploy.sh y
-# avisa desde su máquina, así que hay que abrirlo: BA_ADMIN_BIND lo hace
-# alcanzable y BA_ADMIN_IPS decide quién entra. Las dos cosas, no una.
+# El único que conmuta es el CD, que corre en esta misma máquina y llega por
+# loopback: el default alcanza. Las dos variables quedan para un balanceador
+# que corra en otra casa (Etapa 3): ahí BA_ADMIN_BIND lo hace alcanzable y
+# BA_ADMIN_IPS deja entrar sólo a la IP del CD. Las dos cosas, no una.
 PUERTO_ADMIN = int(os.environ.get("BA_PUERTO_ADMIN", "8081"))
 ADMIN_BIND = os.environ.get("BA_ADMIN_BIND", "127.0.0.1")
 
@@ -418,13 +421,16 @@ class Manejador(BaseHTTPRequestHandler):
         """
         backends = [b.como_json() for b in POOL.todos()]
         sanos = sum(1 for b in backends if b["sano"])
+        encolados = COLA.largo()
         codigo = 200 if sanos else 503
-        bitacora("GET /health", codigo, None, f"sanos={sanos}/{len(backends)}")
+        bitacora("GET /health", codigo, None, f"sanos={sanos}/{len(backends)} encolados={encolados}")
         self.responder(codigo, {
             "balanceador": "sano" if sanos else "sin réplicas",
             "casa": CASA,
             "replicasSanas": sanos,
             "replicasTotales": len(backends),
+            "encolados": encolados,
+            "cota": COLA.cota,
             "backends": backends,
         })
 
@@ -474,7 +480,7 @@ class Manejador(BaseHTTPRequestHandler):
                   {"servidoPor": r.servido_por, "persona": persona_json(r.persona)},
                   destino, f"id={r.persona.id} {detalle}")
 
-    # -- el endpoint privado que usa el deploy.sh de cada casa --
+    # -- el endpoint privado que usa el CD para conmutar blue/green --
 
     def admin_leer(self):
         if not self.admin_permitido():
@@ -486,11 +492,13 @@ class Manejador(BaseHTTPRequestHandler):
         """Conmutación: {"agregar": [...], "quitar": [...]}.
 
         Cada elemento puede ser "host:puerto" (se asume una réplica Python) o un
-        objeto {"destino": "...", "app": "..."}. La forma corta es la que ya
-        manda el deploy.sh, así que ese script no se toca.
+        objeto {"destino": "...", "app": "..."}. La forma corta es la que
+        manda el CD.
 
         Primero se agrega y después se quita, en ese orden: al revés hay un
-        instante con menos réplicas en rotación de las que debería.
+        instante con menos réplicas en rotación de las que debería. Quitar no
+        corta nada: los workers de esa réplica terminan lo que tienen en vuelo
+        y recién ahí se cierra el canal.
         """
         if not self.admin_permitido():
             return self.paso("POST /admin/backends", 403, {"error": "no autorizado"}, None,
@@ -558,7 +566,7 @@ class ManejadorPublico(Manejador):
 
 
 class ManejadorAdmin(Manejador):
-    """El plano de control. Sólo lo alcanzan los deploy.sh de las casas."""
+    """El plano de control. Sólo lo alcanza el CD, por loopback."""
 
     def do_GET(self):
         if self.path.split("?")[0].rstrip("/") == "/admin/backends":
@@ -599,6 +607,7 @@ def main():
     servidor.daemon_threads = True
     bitacora("arranque", "OK", None,
              f"publico=0.0.0.0:{PUERTO} admin={ADMIN_BIND}:{PUERTO_ADMIN} "
+             f"cota={COTA_COLA} workers={WORKERS_POR_REPLICA}/replica presupuesto={PRESUPUESTO}s "
              f"backends={[b.destino for b in POOL.todos()] or '(vacío)'}")
     try:
         servidor.serve_forever()
