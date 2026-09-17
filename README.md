@@ -2,8 +2,12 @@
 
 La única URL pública del servicio. **Habla HTTP hacia afuera y gRPC hacia adentro:**
 recibe el contrato del enunciado (`GET /`, `GET /health`, `POST /echo`,
-`GET /personas`, `POST /personas`), elige una réplica del pool y le hace el RPC de
-`contrato.proto` que corresponda.
+`GET /personas`, `POST /personas`), encola cada pedido, y un hilo *worker* por réplica
+lo saca y le hace el RPC de `contrato.proto` que corresponda.
+
+No elige réplica: **la réplica que tiene un worker libre saca el pedido.** Si no lo pudo
+atender, lo devuelve al frente de la cola y lo saca otra. Un pedido nunca pertenece a
+un servidor.
 
 Traduce en vez de reenviar bytes porque el enunciado pide **una línea de bitácora
 por request diciendo a quién se la derivó**, y para escribir esa línea hay que
@@ -18,55 +22,66 @@ flowchart LR
     subgraph BA["Balanceador — una sola URL pública"]
         direction TB
         DATOS["Plano de datos<br/>0.0.0.0:8080 · HTTP + JSON"]
-        CTRL["Plano de control<br/>8081 · bind + lista blanca por IP"]
+        COLA["Cola en memoria<br/>deque · cota 100 · un presupuesto por pedido"]
+        W["Workers · 4 por réplica<br/>cada uno le habla sólo a la suya"]
+        CTRL["Plano de control<br/>127.0.0.1:8081"]
         BIT["Bitácora<br/>una línea por request"]
     end
 
     REP["Réplicas Python y Java<br/>gRPC · contrato.proto"]
     RD[("Redis compartido<br/>acá vive el estado")]
-    DEP["deploy.sh<br/>de cada casa"]
+    CD["CD · misma máquina<br/>sdypp-cd"]
 
     CLI -->|"HTTP"| DATOS
-    DATOS -->|"gRPC"| REP
+    DATOS -->|"put()"| COLA
+    COLA -->|"get()"| W
+    W -->|"gRPC"| REP
     REP --> RD
-    DEP -->|"POST /admin/backends"| CTRL
-    CTRL -->|"agrega y quita del pool"| DATOS
+    CD -->|"POST /admin/backends<br/>por loopback"| CTRL
+    CTRL -->|"arranca y despide workers"| W
     DATOS --> BIT
 ```
 
-Las réplicas no están hardcodeadas: cada casa se anuncia sola por el plano de
-control cuando corre su `deploy.sh`. El plano de datos nunca conoce `/admin`, y el
-de control nunca ve tráfico del servicio.
+Las réplicas no están hardcodeadas: el CD las conmuta por el plano de control cuando
+despliega una versión. El plano de datos nunca conoce `/admin`, y el de control nunca
+ve tráfico del servicio.
 
 ### Qué hace con cada request
 
 ```mermaid
 flowchart TD
-    A["Llega la request al 8080"] --> B{"¿Hay réplicas<br/>en rotación?"}
-    B -->|"ninguna"| Z["503<br/>no hay réplicas sanas"]
-    B -->|"sí"| C["Round-robin con candado:<br/>elige a quién le toca el turno"]
-    C --> D["Traduce el JSON al mensaje de contrato.proto<br/>y hace el RPC por un canal ya abierto"]
-    D --> E{"¿Qué contestó?"}
+    A["Llega la request al 8080"] --> B{"¿Hay réplicas<br/>en el pool?"}
+    B -->|"ninguna"| Z["503<br/>pool vacío"]
+    B -->|"sí"| C{"¿Entra en la cola?<br/>cota 100"}
+    C -->|"llena"| Z2["503<br/>cola llena"]
+    C -->|"sí"| D["Encola el pedido con un presupuesto de 5 s<br/>y espera la campana"]
+    D --> E["Un worker libre lo saca<br/>y hace el RPC a SU réplica<br/>con el tiempo que le queda"]
+    E --> F{"¿Qué contestó?"}
 
-    E -->|"OK"| F["200 · 201<br/>traduce la respuesta a JSON"]
-    E -->|"INVALID_ARGUMENT<br/>ALREADY_EXISTS<br/>DEADLINE_EXCEEDED"| G["400 · 409 · 504<br/>no se reintenta:<br/>daría igual en todas"]
-    E -->|"UNAVAILABLE<br/>ni miró el pedido"| H["La saca de rotación en el acto"]
+    F -->|"OK"| G["200 · 201<br/>traduce la respuesta a JSON"]
+    F -->|"INVALID_ARGUMENT<br/>ALREADY_EXISTS<br/>..."| H["400 · 409<br/>no se reintenta:<br/>daría igual en todas"]
+    F -->|"UNAVAILABLE<br/>ni miró el pedido"| I["Saca la réplica en el acto<br/>y devuelve el pedido AL FRENTE"]
+    F -->|"DEADLINE_EXCEEDED"| J{"¿Es lectura y<br/>queda tiempo?"}
+    J -->|"sí"| I
+    J -->|"no · o es un alta"| K["504<br/>nunca repetir un alta:<br/>puede duplicarla"]
 
-    H --> I{"¿Queda otra<br/>sin intentar?"}
-    I -->|"sí"| D
-    I -->|"no"| Z
+    I --> E
+    D -.->|"se acabó el presupuesto<br/>sin respuesta"| K
 
-    F --> L["Bitácora: cuándo · quién · qué operación ·<br/>resultado · destino= a quién se derivó"]
-    G --> L
+    G --> L["Bitácora: cuándo · quién · operación · resultado ·<br/>destino= · intentos=a→b · req=id"]
+    H --> L
+    K --> L
     Z --> L
+    Z2 --> L
     L --> M["Responde al cliente"]
 
-    V["Hilo vigilante · cada 3 s<br/>grpc.health.v1.Health"] -.->|"2 fallos la sacan<br/>1 éxito la devuelve"| C
+    V["Hilo vigilante · cada 3 s<br/>grpc.health.v1.Health"] -.->|"2 fallos la sacan: sus workers duermen<br/>1 éxito la devuelve: despiertan"| E
 ```
 
-El reintento y el `destino=` de la bitácora son los dos agregados propios: el
-enunciado pide elegir, reenviar y responder, y esto además tapa la muerte de una
-réplica y deja la operación auditable.
+La reasignación y el `req=` de la bitácora son los dos agregados propios: el enunciado
+pide elegir, reenviar y responder, y esto además tapa la muerte de una réplica y deja
+la operación auditable — el mismo `req=` aparece en la casa que murió (sin respuesta)
+y en la que atendió.
 
 ## Levantarlo
 
@@ -75,24 +90,41 @@ docker build -t sdypp-balanceador:local .
 
 docker run -d --name sdypp-ba --restart unless-stopped --network host \
     -e BA_CASA=casa-tomas \
-    -e BA_BACKENDS=100.91.134.43:8080,100.78.246.64:8080 \
-    -e BA_ADMIN_BIND=0.0.0.0 \
-    -e BA_ADMIN_IPS=127.0.0.1,100.101.15.93,100.78.246.64,100.120.186.92,100.91.134.43 \
+    -e BA_BACKENDS=100.101.15.93:8090,100.91.134.43:8080,100.118.61.111:8111=java,100.118.61.111:8112=java \
     -v "$PWD/logs:/app/logs" \
     sdypp-balanceador:local
 
 curl -s localhost:8080/health | python3 -m json.tool
 ```
 
-`--network host` no es capricho: el plano de control tiene que atarse a una
-dirección del tailnet para que las casas conmuten, y `BA_ADMIN_IPS` lleva las IPs
-de las que pueden hacerlo. Sin esas dos variables el balanceador arranca igual,
-pero el `deploy.sh` de cada casa recibe **403** al avisar.
+`--network host` es para que el CD, que corre en esta misma máquina también con
+`--network host`, llegue al plano de control por `127.0.0.1:8081`. Nada más lo alcanza.
 
 Sin Docker: `python3 -m venv .venv`, `./.venv/bin/pip install -r requirements.txt
 -r requirements-build.txt`, generar los stubs con `./.venv/bin/python -m
 grpc_tools.protoc -I. --python_out=app --grpc_python_out=app contrato.proto` y
 `./.venv/bin/python app/balanceador.py`.
+
+## Pruebas
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -v
+```
+
+Sólo `unittest`. `test_cola.py` y `test_worker.py` no necesitan nada más que `grpcio`;
+`test_derivar.py` importa el balanceador y necesita los stubs generados. Ninguno abre
+una conexión: las réplicas se simulan con un stub falso que decide qué contestar.
+
+- **`Cola`**: la cota rechaza sin bloquear, el orden es FIFO, lo devuelto al frente sale
+  primero, `get` bloquea de verdad y sale sin sacar nada cuando su réplica deja de estar
+  viva, y 8 hilos sacando 200 pedidos no repiten ni pierden ninguno.
+- **`Worker`**: cada fila de la tabla de reintento, la metadata, el pedido vencido en la
+  cola (no gasta el RPC), y la reasignación completa entre una réplica caída y una viva.
+- **`derivar`**: 503 inmediato sin réplicas o con la cola llena, 504 al vencer el
+  presupuesto, traducción de códigos, e `intentos=a→b` en la bitácora.
+
+Contra réplicas de verdad, con el verificador en `--hilos 32` y `docker stop` de una
+réplica a mitad de la corrida: 4000/4000 OK y una línea con `intentos=` en la bitácora.
 
 ## Verificador
 
@@ -111,62 +143,97 @@ Informa códigos, reparto por instancia, latencia p50/p95/p99 y throughput, y co
 | | Puerto | Escucha en | Qué sirve |
 | :--- | :--- | :--- | :--- |
 | **Datos** | `8080` | `0.0.0.0` | El contrato público. En `/admin` devuelve **404** |
-| **Control** | `8081` | `127.0.0.1` por defecto | Sólo `/admin/backends` |
+| **Control** | `8081` | `127.0.0.1` | Sólo `/admin/backends` |
 
 `/admin/backends` decide a dónde va **todo** el tráfico: quien lo toca manda el
 servicio a donde quiera. Por eso no vive en el puerto público sino en un socket
-propio, que por defecto escucha únicamente en loopback: **lo que no escucha en la
-red no se puede atacar desde la red.**
+propio que escucha únicamente en loopback: **lo que no escucha en la red no se puede
+atacar desde la red.**
 
-Ese default no alcanza acá. Cada casa despliega la suya y avisa desde su propia
-máquina, así que el plano de control tiene que salir al tailnet:
-`BA_ADMIN_BIND=0.0.0.0` **y** `BA_ADMIN_IPS` con las IPs de las casas. Las dos
-cosas, no una: el bind lo hace alcanzable y la lista blanca decide quién entra.
-
-Es una concesión consciente y conviene decirla así en el informe: mientras el
-deploy lo disparaba un proceso en esta misma máquina, el socket podía quedarse en
-loopback. Al repartir el deploy entre las cuatro casas, la superficie de ataque
-del plano de control pasó de cero a cuatro direcciones autorizadas. A cambio
-desaparecieron las claves SSH entre casas, que era la superficie más grande.
+El único que conmuta es el CD, y corre en esta misma máquina. En la primera versión
+cada casa desplegaba la suya y avisaba desde su máquina, y el plano de control tenía
+que salir al tailnet con una lista blanca de cuatro IPs. Con el CD central la
+superficie vuelve a cero direcciones. `BA_ADMIN_BIND` y `BA_ADMIN_IPS` quedan para la
+Etapa 3: un segundo balanceador en otra casa las usa para dejar entrar **sólo** a la IP
+de la Plataforma.
 
 La conmutación es HTTP y no un RPC nuevo, así que **`contrato.proto` no se toca** —
 el que ya tiene el equipo Java sigue siendo válido.
 
 ```
-POST /admin/backends   {"agregar": ["casa:8081"], "quitar": ["casa:8080"]}
+POST /admin/backends   {"agregar": ["casa:8091"], "quitar": ["casa:8090"]}
 ```
 
 Primero agrega y después quita: al revés hay un instante con menos réplicas en
-rotación. Acepta `"host:puerto"` (la forma que ya manda el `deploy.sh`, que por eso
-no hubo que tocar) o `{"destino": "...", "app": "..."}`.
+rotación. Quitar no corta nada: los workers de esa réplica terminan lo que tienen en
+vuelo y recién ahí se cierra el canal. Acepta `"host:puerto"` o
+`{"destino": "...", "app": "..."}`.
+
+## Por qué la cola vive adentro
+
+La cola y los workers son hilos del mismo proceso, no un contenedor aparte. Se pensó
+como servicio separado y se descartó por tres razones:
+
+1. **No tiene ciclo de vida propio.** Se levanta con el balanceador, se baja con él,
+   se configura con él. Un contenedor que no puede existir sin otro no es un servicio,
+   es una parte.
+2. **Agregaría un salto y un punto de falla** por request, para ganar nada: el
+   balanceador ya es el único proceso que ve todos los pedidos.
+3. **La Etapa 3 la haría inútil.** Dos balanceadores compartiendo una cola vuelven a
+   tener un punto único de falla, justo el que la Etapa 3 quiere eliminar. Y como el
+   contrato es sincrónico (el cliente espera la respuesta en el mismo socket), un
+   pedido que un balanceador tomó y otro atendió no tiene por dónde volver. Por eso la
+   Etapa 3 son dos balanceadores **independientes**, cada uno con su cola, sin
+   hablarse. Nada de `cola.py` cambia.
+
+## Reglas
+
+**Un presupuesto por pedido, espera incluida.** `BA_TIMEOUT_RPC=5` son cinco segundos
+desde que el pedido entra a la cola hasta que el cliente tiene respuesta. Un pedido que
+esperó 4 s tiene 1 s de RPC. Lo que le importa al cliente es cuánto tarda la respuesta,
+no en qué parte del camino se fue el tiempo.
+
+**Cota de 100.** Pasado eso, `503` en el acto. Sin cota, con todas las réplicas caídas
+los pedidos se acumulan sin límite hasta vencer; cada uno es un hilo del servidor y un
+cliente colgado.
+
+**La regla de reintento.** Es contrato, no detalle de implementación:
+
+| Código gRPC | Lecturas (`Identidad`, `Echo`, `ListarPersonas`) | Escritura (`CrearPersona`) |
+| :--- | :--- | :--- |
+| `UNAVAILABLE` | devolver al frente + sacar la réplica | igual |
+| `DEADLINE_EXCEEDED` | devolver al frente si queda tiempo; si no, `504` | **`504`. Nunca reintentar.** |
+| `INVALID_ARGUMENT`, `ALREADY_EXISTS`, otros | ese código | ese código |
+
+`UNAVAILABLE` significa que la réplica ni miró el pedido: reintentar es gratis.
+`DEADLINE_EXCEEDED` en un alta significa "no sé si se ejecutó": repetirla puede crear
+la persona dos veces. Preferimos un `504` honesto a un duplicado silencioso.
+
+**No se persiste.** La cola vive en memoria: si el balanceador muere, los pedidos que
+tenía adentro mueren con él — y también el socket HTTP por el que el cliente esperaba,
+así que persistirlos no le devolvería nada a nadie.
 
 ## Decisiones
 
-**Round-robin con candado.** El contador del turno es un dato compartido entre los
-hilos que atienden requests. Sin candado, dos hilos leen el mismo valor, las dos
-requests van a la misma réplica y la siguiente se saltea. Es el problema de
-exclusión mutua de la materia, dentro de un proceso. Medido: 60 requests con 6
-hilos dan 30/30.
+**Consumidores que compiten, sin round-robin.** Nadie reparte: cada réplica tiene 4
+workers que sacan de la cola cuando pueden. Una réplica lenta saca menos; una caída no
+saca nada. El reparto sale solo de la velocidad de cada una, sin contador compartido.
+Medido con 32 hilos: 206 / 200.
 
 **Salud preguntando, y también reaccionando.** Un hilo consulta
 `grpc.health.v1.Health` cada 3 s. Si sólo esperáramos a que una request falle, cada
 muerte le costaría un error a un usuario real; si sólo preguntáramos, entre dos
-chequeos hay una ventana. Se hacen las dos: una request que falla con `UNAVAILABLE`
-saca la réplica en el acto y se reintenta en la siguiente.
+chequeos hay una ventana. Se hacen las dos, y **alimentan el mismo contador**: un
+`UNAVAILABLE` en un worker cuenta como un chequeo fallido.
 
 **Dos fallos para sacar, uno para volver.** Un timeout aislado es normal en una red
 doméstica. Sacar una réplica sana por un hipo de red cuesta más que atender una
 request de más contra una que ya murió.
 
-**Se reintenta sólo `UNAVAILABLE`.** Significa que la réplica ni miró el pedido: la
-conexión no se pudo abrir, no hay nada hecho a medias. Un `INVALID_ARGUMENT` va a
-dar igual en todas — reintentarlo sería repetir el mismo error N veces.
-
-**Último recurso.** Si no queda ninguna réplica sana, se intenta igual con las
-caídas antes de devolver `503`: entre dos chequeos una puede haber revivido.
-
 **Un canal gRPC por réplica, reusado.** gRPC multiplexa varias llamadas sobre la
 misma conexión HTTP/2; abrir un canal por request tiraría el handshake a la basura.
+El canal lo cierra el último worker en irse: mientras quede otro puede tener un RPC
+en vuelo sobre esa misma conexión.
 
 ## Traducción de errores
 
@@ -175,8 +242,9 @@ misma conexión HTTP/2; abrir un canal por request tiraría el handshake a la ba
 | `OK` | `200` · `201` en alta |
 | `INVALID_ARGUMENT` | `400` |
 | `ALREADY_EXISTS` | `409` |
-| `UNAVAILABLE` | `503` (y saca la réplica) |
+| `UNAVAILABLE` en todas | `504` al vencer el presupuesto |
 | `DEADLINE_EXCEEDED` | `504` |
+| — | `503` sin réplicas en el pool · `503` cola llena |
 
 ## Bitácora
 
@@ -184,10 +252,14 @@ Mismo formato que el de las réplicas, a propósito: es lo que permite tomar un 
 del verificador y seguirla por dos archivos en dos casas.
 
 ```
-2026-09-08T14:03:22-03:00 | balanceador@casa-tomas | POST /personas | 201 | destino=100.91.134.43:8080 id=7
+2026-09-17T02:15:33-03:00 | balanceador@casa-tomas | POST /personas | 201 | destino=100.91.134.43:8080 id=7 req=4b7baf0d2d4a4e909ec90c6f17690125
+2026-09-17T02:15:33-03:00 | balanceador@casa-tomas | GET / | 200 | destino=100.101.15.93:8080 host=tomas-blue intentos=100.101.15.93:8090→100.101.15.93:8080 req=216fdab3aed647099557e2dcd8c220f5
 ```
 
-El balanceador dice **a quién derivó**; el log de esa casa dice **qué hizo**.
+El balanceador dice **a quién derivó**; el log de esa casa dice **qué hizo**. El
+`req=` viaja a la réplica como metadata `x-request-id` (la misma en cada intento), e
+`intentos=a→b` aparece sólo cuando hubo reasignación: es la evidencia de que la
+réplica `a` murió y `b` atendió el mismo pedido.
 
 ## Variables
 
@@ -195,23 +267,28 @@ El balanceador dice **a quién derivó**; el log de esa casa dice **qué hizo**.
 | :--- | :--- | :--- |
 | `BA_PUERTO` | `8080` | Puerto público |
 | `BA_PUERTO_ADMIN` | `8081` | Plano de control |
-| `BA_ADMIN_BIND` | `127.0.0.1` | Dónde escucha el control |
+| `BA_ADMIN_BIND` | `127.0.0.1` | Dónde escucha el control. Sólo se cambia en la Etapa 3 |
 | `BA_ADMIN_IPS` | *(vacío)* | Whitelist; vacío = sólo loopback |
 | `BA_CASA` | `casa-tomas` | Sale en la bitácora |
 | `BA_BACKENDS` | *(vacío)* | Réplicas iniciales, separadas por coma. `host:puerto` o `host:puerto=java` |
+| `BA_COTA_COLA` | `100` | Pedidos que pueden esperar; llena → `503` |
+| `BA_WORKERS_POR_REPLICA` | `4` | Hilos por réplica = pedidos en vuelo por réplica |
+| `BA_TIMEOUT_RPC` | `5` | Presupuesto total por pedido, espera en cola incluida |
 | `BA_INTERVALO_SALUD` | `3` | Segundos entre chequeos |
-| `BA_FALLOS_PARA_SACAR` | `2` | Fallos seguidos que sacan de rotación |
-| `BA_TIMEOUT_RPC` | `5` | Segundos por RPC |
+| `BA_FALLOS_PARA_SACAR` | `2` | Fallos seguidos que sacan de rotación (chequeo o request) |
+| `BA_EXITOS_PARA_VOLVER` | `1` | Chequeos buenos seguidos que la devuelven |
+| `BA_TIMEOUT_SALUD` | `2` | Segundos por chequeo de salud |
 
 ## Estado
 
 | | |
 | :--- | :--- |
-| ✅ | Pool con round-robin y candado |
-| ✅ | Health check continuo + expulsión + reingreso |
-| ✅ | Conmutación por HTTP sin tocar el `.proto` |
-| ✅ | Plano de control aislado en loopback |
-| ✅ | Bitácora cruzable con la de las réplicas |
+| ✅ | Cola en memoria + workers por réplica, sin round-robin |
+| ✅ | Reasignación al frente de la cola; un alta nunca se repite |
+| ✅ | Health check continuo + expulsión + reingreso, con el mismo contador que los workers |
+| ✅ | Conmutación por HTTP sin tocar el `.proto`, sólo desde el CD por loopback |
+| ✅ | Bitácora cruzable con la de las réplicas: `req=` e `intentos=` |
+| ✅ | Tests: cola, worker, derivar |
 | ✅ | Verificador con reparto y percentiles |
-| ⬜ | Etapa 3: dos balanceadores |
 | ✅ | Réplicas Java en el pool: mismo `contrato.proto`, mismo health check |
+| ⬜ | Etapa 3: dos balanceadores independientes |
