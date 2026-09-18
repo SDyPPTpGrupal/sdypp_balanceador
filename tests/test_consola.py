@@ -81,7 +81,38 @@ class PruebasOrdenDocker(unittest.TestCase):
         self.assertNotIn("docker.sock", orden)
 
 
+class PruebasDosContenedores(unittest.TestCase):
+    """Un solo archivo de configuración para el balanceador y la cola. Lo que se
+    prueba acá es lo que se rompe cuando se separan."""
+
+    def test_los_dos_usan_el_mismo_env_file(self):
+        """Si fueran dos archivos, el token quedaría distinto en cada uno tarde o
+        temprano, y la cola contestaría 403 a todo sin decir por qué."""
+        self.assertIn(consola.CONFIG, consola.orden_docker())
+        self.assertIn(consola.CONFIG, consola.orden_docker_cola())
+
+    def test_la_cola_es_otro_contenedor_y_otra_imagen(self):
+        self.assertNotEqual(consola.CONTENEDOR, consola.CONTENEDOR_COLA)
+        self.assertNotEqual(consola.IMAGEN, consola.IMAGEN_COLA)
+
+    def test_la_configuracion_tiene_las_dos_familias(self):
+        cfg = consola.leer_config()
+        self.assertIn("BA_COLA_URL", cfg)
+        self.assertIn("COLA_COTA_PEDIDOS", cfg)
+
+    def test_la_cola_tampoco_pide_privilegios(self):
+        orden = " ".join(consola.orden_docker_cola())
+        self.assertNotIn("--privileged", orden)
+        self.assertNotIn("docker.sock", orden)
+
+
 class PruebasURLs(unittest.TestCase):
+
+    def test_la_cola_se_consulta_por_loopback(self):
+        """La consola corre en la misma máquina que la cola; salir por la IP de
+        Tailscale para hablar con uno mismo es dar una vuelta al pedo."""
+        self.assertEqual(consola.url_cola(dict(consola.DEFAULTS, COLA_PUERTO="8085")),
+                         "http://127.0.0.1:8085")
 
     def test_el_control_siempre_se_consulta_por_loopback(self):
         """Aunque BA_ADMIN_BIND sea una IP del tailnet: la consola corre en la

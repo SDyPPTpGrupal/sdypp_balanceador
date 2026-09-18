@@ -1,8 +1,14 @@
-"""Pruebas del plano de control: cómo entra un backend al pool y con qué `app`.
+"""Pruebas del plano de control: cómo entra un backend al registro y con qué `app`.
 
 Importa porque el CD conmuta con un POST incremental: lo que no se nombra en el
 JSON tiene que quedar intacto. De eso depende que un deploy de Python no toque
 las réplicas Java, y al revés.
+
+Ojo con lo que el pool significa desde que los workers viven en las réplicas:
+es el **registro** de qué réplicas hay y si están sanas, no el interruptor del
+tráfico. Quitar un destino de acá no lo saca de circulación —sigue consumiendo
+de la cola hasta que se apague su contenedor—, pero sí cambia lo que /health
+cuenta y lo que el CD ve.
 
     python -m unittest discover -s tests -v
 """
@@ -14,7 +20,6 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
 
 from balanceador import Pool, normalizar_destino  # noqa: E402
-from cola import Cola  # noqa: E402
 
 
 class PruebasNormalizar(unittest.TestCase):
@@ -45,7 +50,7 @@ class PruebasNormalizar(unittest.TestCase):
 class PruebasPool(unittest.TestCase):
 
     def setUp(self):
-        self.pool = Pool(Cola(10))
+        self.pool = Pool()
 
     def agregar(self, destino, app="python"):
         return self.pool.agregar(destino, app)
@@ -70,9 +75,9 @@ class PruebasPool(unittest.TestCase):
         self.assertFalse(self.pool.quitar("10.0.0.1:8080"))
 
     def test_un_deploy_de_python_no_toca_las_java(self):
-        """El caso real: dos casas Python y dos Java en el pool. El CD conmuta las
-        Python y el POST ni menciona a las Java, que tienen que quedar igual —
-        mismos objetos, con sus workers y sus contadores."""
+        """El caso real: dos casas Python y dos Java en el registro. El CD
+        conmuta las Python y el POST ni menciona a las Java, que tienen que
+        quedar igual — los mismos objetos, con su canal de salud abierto."""
         self.agregar("10.0.0.1:8090", "python")
         self.agregar("10.0.0.2:8080", "python")
         java_1 = self.agregar("10.0.0.4:8111", "java")
@@ -93,14 +98,15 @@ class PruebasPool(unittest.TestCase):
         self.assertEqual(vivos["10.0.0.4:8111"].como_json()["app"], "java")
 
     def test_reagregar_un_destino_crea_otro_backend(self):
-        """`tiene()` compara por identidad justamente por esto: los workers del
-        backend viejo tienen que irse aunque el destino vuelva a estar en el pool."""
+        """Un destino que vuelve es un backend nuevo, con sus contadores de
+        salud en cero: el histórico de fallos del anterior era de otro
+        contenedor y arrastrarlo haría que el nuevo entre marcado caído."""
         viejo = self.agregar("10.0.0.1:8080")
+        viejo.fallos = 5
         self.pool.quitar("10.0.0.1:8080")
         nuevo = self.agregar("10.0.0.1:8080")
         self.assertIsNot(viejo, nuevo)
-        self.assertFalse(self.pool.tiene(viejo))
-        self.assertTrue(self.pool.tiene(nuevo))
+        self.assertEqual(nuevo.fallos, 0)
 
 
 if __name__ == "__main__":
