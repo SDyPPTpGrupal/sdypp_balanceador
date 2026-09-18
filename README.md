@@ -86,11 +86,45 @@ y en la que atendió.
 ## Levantarlo
 
 ```bash
-docker build -t sdypp-balanceador:local .
+python3 consola.py
+```
 
+La primera vez pregunta lo que hace falta, guarda **`balanceador.env`** —que es el
+`--env-file` del contenedor— y lo levanta. Después es el menú:
+
+```
+  Balanceador · casa-tomas · público :8080 · control 127.0.0.1:8081
+  3/3 sanas · 0/100 en cola
+
+  1  Pool                     qué réplicas hay, sanas, en vuelo y atendidas
+  2  Health público           lo que ve el verificador
+  3  Tráfico de prueba        correr el verificador contra este balanceador
+  4  Agregar / quitar backend  a mano, para una emergencia
+  5  Bitácora                 últimas 25 líneas
+  6  Contenedor               levantar, reiniciar, bajar, logs
+  7  Configuración            ver y editar
+  8  Consola del CD           el otro componente de Plataforma
+  0  Salir
+```
+
+**El pool arranca vacío a propósito.** `BA_BACKENDS` queda sin usar: lo llena el CD en el
+primer deploy. Precargarlo haría que el balanceador afirme tener réplicas que quizá ya no
+existen. Hasta ese primer deploy, `/health` contesta `503`, que es correcto: no hay a quién
+mandarle nada.
+
+La pregunta que importa del asistente es **quién puede tocar `/admin/backends`**: quien lo
+alcance decide a dónde va todo el tráfico. El default es `127.0.0.1`, porque el CD corre en
+esta misma máquina; la otra opción (un CD remoto, Etapa 3) obliga a declarar una lista blanca.
+
+La opción 8 abre la consola del CD, que vive en el repo `cd` al lado: **Plataforma corre los dos
+componentes**, y el orden importa — primero el balanceador, después el CD.
+
+### A mano, si preferís
+
+```bash
+docker build -t sdypp-balanceador:local .
 docker run -d --name sdypp-ba --restart unless-stopped --network host \
-    -e BA_CASA=casa-tomas \
-    -e BA_BACKENDS=100.101.15.93:8090,100.91.134.43:8080,100.118.61.111:8111=java,100.118.61.111:8112=java \
+    --env-file balanceador.env \
     -v "$PWD/logs:/app/logs" \
     sdypp-balanceador:local
 
