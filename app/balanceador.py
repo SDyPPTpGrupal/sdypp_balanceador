@@ -7,6 +7,19 @@ encola cada pedido y un worker por réplica le hace el RPC correspondiente de
 contrato.proto (ver cola.py). No elige réplica: la que tiene un worker libre
 saca el pedido, y si no lo pudo atender lo devuelve para que lo saque otra.
 
+El contrato con el cliente: **toda** respuesta del plano público sale con la
+misma forma, salga bien o mal.
+
+    {"Code": 200, "contenido": {"app": "python", "version": 3, ...}}
+    {"Code": 404, "contenido": {"error": "no existe"}}
+
+`Code` repite el código HTTP y `contenido` es siempre un objeto. Antes el éxito
+devolvía los campos al ras y el error un `{"error": ...}`: dos formas distintas,
+así que el cliente tenía que adivinar cuál le tocó antes de poder leer nada. Con
+el sobre parsea igual siempre y recién después mira el `Code`. El sobre lo pone
+`Manejador.responder`, no cada handler: es la única forma de garantizar que no
+se escape ninguna respuesta por un camino de error que nadie probó.
+
     python3 app/balanceador.py
 
     BA_PUERTO=8080 BA_BACKENDS=salvador:8080,mateon:8080 python3 app/balanceador.py
@@ -369,8 +382,14 @@ def derivar(operacion, llamar, idempotente=True, cliente=None):
 # --- El servidor HTTP ------------------------------------------------------
 
 class Manejador(BaseHTTPRequestHandler):
-    server_version = "balanceador/2.0"
+    server_version = "balanceador/2.1"
     protocol_version = "HTTP/1.1"
+
+    # ¿Se envuelve la respuesta en el sobre del contrato? Sí en el plano
+    # público (ManejadorPublico), no en el de control: /admin/backends lo
+    # consume el CD, que no es un cliente del servicio, y envolverlo obligaría
+    # a tocar control.py y las dos consolas sin que nadie lo haya pedido.
+    sobre = False
 
     def log_message(self, *_):
         pass  # el registro lo lleva la bitácora, con el formato del contrato
@@ -378,6 +397,8 @@ class Manejador(BaseHTTPRequestHandler):
     # -- utilidades --
 
     def responder(self, codigo, cuerpo):
+        if self.sobre:
+            cuerpo = {"Code": codigo, "contenido": cuerpo}
         crudo = json.dumps(cuerpo, ensure_ascii=False).encode()
         self.send_response(codigo)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -551,7 +572,12 @@ class Manejador(BaseHTTPRequestHandler):
 
 
 class ManejadorPublico(Manejador):
-    """El puerto que ve el mundo. No sabe qué es /admin: ahí devuelve 404."""
+    """El puerto que ve el mundo. No sabe qué es /admin: ahí devuelve 404.
+
+    Todo lo que sale de acá va envuelto en {"Code": …, "contenido": {…}}.
+    """
+
+    sobre = True
 
     def do_GET(self):
         ruta = self.path.split("?")[0].rstrip("/") or "/"

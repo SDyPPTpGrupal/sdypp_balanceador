@@ -83,6 +83,52 @@ pide elegir, reenviar y responder, y esto además tapa la muerte de una réplica
 la operación auditable — el mismo `req=` aparece en la casa que murió (sin respuesta)
 y en la que atendió.
 
+## El contrato con el cliente
+
+**Toda** respuesta del puerto público tiene la misma forma, salga bien o mal:
+
+```json
+{"Code": 200, "contenido": { ... }}
+```
+
+`Code` repite el código HTTP de la línea de estado y `contenido` es siempre un objeto.
+El cliente parsea igual siempre y recién después mira el `Code`; no tiene que adivinar
+el esquema según cómo salió la operación.
+
+```console
+$ curl -s localhost:8080/
+{"Code": 200, "contenido": {"app": "python", "version": 3, "host": "casa-meizers-green", ...}}
+
+$ curl -s localhost:8080/noexiste
+{"Code": 404, "contenido": {"error": "no existe"}}
+
+$ curl -s -X POST -d 'no soy json' localhost:8080/echo
+{"Code": 400, "contenido": {"error": "cuerpo no es JSON"}}
+
+$ curl -s localhost:8080/personas          # con Redis caído
+{"Code": 504, "contenido": {"error": "sin respuesta a tiempo"}}
+```
+
+Antes el éxito devolvía los campos al ras y el error un `{"error": ...}`: dos esquemas
+distintos por la misma URL. El cliente tenía que chequear si existía la clave `error`
+antes de poder leer cualquier otra cosa, y bastaba un camino de error que nadie probó
+para romperlo.
+
+Tres decisiones que vale aclarar:
+
+- **El HTTP sigue diciendo la verdad.** Un 404 se responde con status 404, no con un 200
+  que trae el error adentro. El sobre uniforma el *cuerpo*; no esconde el resultado de
+  quien lee sólo la línea de estado (un balanceador de nube, un health check, `curl -f`).
+- **El sobre lo pone `Manejador.responder`, no cada handler.** Es la única forma de que no
+  se escape ninguna respuesta: un 404 o un 503 nuevo lo hereda sin que nadie se acuerde.
+- **`/admin/backends` no va envuelto.** Lo consume el CD, que no es un cliente del
+  servicio. Envolverlo obligaría a tocar `control.py` y las dos consolas para nada.
+
+Lo fija `tests/test_sobre.py`: que `Code` coincida con el status, que `contenido` sea
+siempre un objeto, que el `Content-Length` cuente el sobre (si midiera el cuerpo sin
+envolver, el cliente se cuelga esperando bytes que no llegan) y que el plano de control
+siga al ras.
+
 ## Levantarlo
 
 ```bash
@@ -291,6 +337,8 @@ en vuelo sobre esa misma conexión.
 | `UNAVAILABLE` en todas | `504` al vencer el presupuesto |
 | `DEADLINE_EXCEEDED` | `504` |
 | — | `503` sin réplicas en el pool · `503` cola llena |
+
+El código va dos veces: en la línea de estado HTTP y en el `Code` del sobre. Son siempre el mismo valor — `tests/test_sobre.py` lo verifica para los ocho códigos que el balanceador puede devolver.
 
 ## Bitácora
 

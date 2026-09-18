@@ -225,9 +225,21 @@ def backends(cfg):
         return None
 
 
+def desenvolver(datos):
+    """El plano público contesta {"Code": …, "contenido": {…}}; el de control no.
+
+    Se usa sólo con las rutas públicas. Si no viene envuelto se devuelve igual,
+    así la consola sigue sirviendo contra un balanceador sin actualizar.
+    """
+    if isinstance(datos, dict) and "Code" in datos and "contenido" in datos:
+        return datos["contenido"]
+    return datos
+
+
 def salud(cfg):
     try:
-        return pedir_json(f"{url_publica(cfg)}/health")
+        codigo, datos = pedir_json(f"{url_publica(cfg)}/health")
+        return codigo, desenvolver(datos)
     except (urllib.error.URLError, OSError, ValueError):
         return None, None
 
@@ -326,6 +338,9 @@ def ver_health(cfg):
     for clave in ("balanceador", "casa", "replicasSanas", "replicasTotales", "encolados", "cota"):
         if clave in datos:
             print(f"    {clave:<16} {datos[clave]}")
+    print()
+    nota(f'el cuerpo viaja envuelto: {{"Code": {codigo}, "contenido": {{…}}}}')
+    nota("misma forma para el éxito y para el error; lo de arriba es el contenido")
 
 
 def tocar_pool(cfg):
