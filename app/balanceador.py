@@ -266,6 +266,21 @@ class Pool:
             return list(self._backends.values())
 
 
+def normalizar_destino(x):
+    """Un elemento de `agregar`/`quitar` → (destino, app).
+
+    Se aceptan las dos formas: "host:puerto" y {"destino": ..., "app": ...}. La
+    corta asume Python por compatibilidad con el CD viejo, que mandaba strings
+    pelados; por eso el CD manda hoy la forma larga, o las réplicas Java
+    figurarían como Python en /health.
+    """
+    if isinstance(x, str):
+        return x, "python"
+    if isinstance(x, dict) and x.get("destino"):
+        return x["destino"], x.get("app") or "python"
+    return None, None
+
+
 COLA = Cola(COTA_COLA)
 POOL = Pool(COLA)
 
@@ -492,8 +507,9 @@ class Manejador(BaseHTTPRequestHandler):
         """Conmutación: {"agregar": [...], "quitar": [...]}.
 
         Cada elemento puede ser "host:puerto" (se asume una réplica Python) o un
-        objeto {"destino": "...", "app": "..."}. La forma corta es la que
-        manda el CD.
+        objeto {"destino": "...", "app": "..."}. El CD manda la forma larga: con
+        la corta, una réplica Java entraría al pool etiquetada como Python y
+        /health mentiría.
 
         Primero se agrega y después se quita, en ese orden: al revés hay un
         instante con menos réplicas en rotación de las que debería. Quitar no
@@ -507,16 +523,9 @@ class Manejador(BaseHTTPRequestHandler):
         if cuerpo is None:
             return self.paso("POST /admin/backends", 400, {"error": "cuerpo no es JSON"}, None, None)
 
-        def normalizar(x):
-            if isinstance(x, str):
-                return x, "python"
-            if isinstance(x, dict) and x.get("destino"):
-                return x["destino"], x.get("app", "python")
-            return None, None
-
         agregados, quitados = [], []
         for x in cuerpo.get("agregar") or []:
-            destino, app = normalizar(x)
+            destino, app = normalizar_destino(x)
             if not destino:
                 continue
             backend = POOL.agregar(destino, app)
@@ -528,7 +537,7 @@ class Manejador(BaseHTTPRequestHandler):
                 backend.chequear()
                 agregados.append(destino)
         for x in cuerpo.get("quitar") or []:
-            destino, _ = normalizar(x)
+            destino, _ = normalizar_destino(x)
             if destino and POOL.quitar(destino):
                 quitados.append(destino)
 

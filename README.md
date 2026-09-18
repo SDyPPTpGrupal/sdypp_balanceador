@@ -161,13 +161,25 @@ La conmutación es HTTP y no un RPC nuevo, así que **`contrato.proto` no se toc
 el que ya tiene el equipo Java sigue siendo válido.
 
 ```
-POST /admin/backends   {"agregar": ["casa:8091"], "quitar": ["casa:8090"]}
+POST /admin/backends   {"agregar": [{"destino": "casa:8091", "app": "python"}],
+                        "quitar":  [{"destino": "casa:8090", "app": "python"}]}
 ```
 
 Primero agrega y después quita: al revés hay un instante con menos réplicas en
 rotación. Quitar no corta nada: los workers de esa réplica terminan lo que tienen en
-vuelo y recién ahí se cierra el canal. Acepta `"host:puerto"` o
-`{"destino": "...", "app": "..."}`.
+vuelo y recién ahí se cierra el canal.
+
+**Es un delta, no un reemplazo.** El pool es un diccionario y el POST suma y resta:
+un destino que no aparece en el JSON queda exactamente donde estaba, con su mismo
+objeto `Backend`, sus workers y sus contadores. De eso depende que un deploy de Python
+no toque las réplicas Java, y al revés — los dos equipos despliegan sin coordinarse.
+
+Se aceptan las dos formas, `"host:puerto"` y `{"destino": ..., "app": ...}`. La corta
+asume `python` por compatibilidad con el CD viejo, que mandaba strings pelados; el CD
+manda **la larga**, porque con la corta una réplica Java entraría al pool etiquetada
+como Python y `/health` mentiría. El campo `app` es informativo: no interviene en el
+ruteo, todas las réplicas comen de la misma cola. `tests/test_admin.py` cubre las dos
+formas y el caso de los dos equipos conviviendo en el pool.
 
 ## Por qué la cola vive adentro
 

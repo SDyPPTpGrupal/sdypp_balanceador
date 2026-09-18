@@ -44,8 +44,11 @@ ENV BA_PUERTO=8080 \
 EXPOSE 8080
 
 # Se chequea a sí mismo: 200 mientras tenga al menos una réplica en rotación.
+# El puerto sale de BA_PUERTO y no va fijo: con el puerto hardcodeado, levantar el
+# balanceador en otro puerto lo deja marcado unhealthy aunque esté sirviendo bien,
+# y eso en una demo se confunde con una caída de verdad.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; p=os.environ.get('BA_PUERTO','8080'); sys.exit(0 if urllib.request.urlopen(f'http://localhost:{p}/health',timeout=2).status==200 else 1)"
 
 STOPSIGNAL SIGTERM
 
