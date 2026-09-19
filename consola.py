@@ -59,29 +59,6 @@ def nota(t):
     print(pintar(f"  {t}", "90"))
 
 
-def consola_vecina():
-    """La consola del CD, si el repo está al lado.
-
-    Plataforma corre el balanceador y el CD en la misma máquina, en repos
-    distintos: sin esto hay que acordarse de en qué carpeta vive cada consola.
-    """
-    ruta = os.path.join(os.path.dirname(RAIZ), "cd", "consola.py")
-    return ruta if os.path.isfile(ruta) else None
-
-
-def abrir_vecina():
-    ruta = consola_vecina()
-    if not ruta:
-        mal("no encuentro el repo `cd` al lado de este")
-        return
-    print()
-    nota(f"abriendo {ruta} — al salir volvés acá")
-    try:
-        subprocess.run([sys.executable, ruta], check=False)
-    except (OSError, KeyboardInterrupt):
-        pass
-
-
 def pausa():
     try:
         input(pintar("\n  ⏎ para volver al menú ", "90"))
@@ -676,7 +653,6 @@ MENU = """
   5  Bitácora                 últimas 25 líneas
   6  Contenedores             balanceador y cola: levantar, bajar, logs
   7  Configuración            ver y editar
-  8  Consola del CD           el otro componente de Plataforma
   0  Salir"""
 
 
@@ -716,8 +692,6 @@ def main():
             menu_contenedor(cfg)
         elif opcion == "7":
             ver_config(cfg)
-        elif opcion == "8":
-            abrir_vecina()
         elif opcion == "0":
             return 0
         elif opcion:
