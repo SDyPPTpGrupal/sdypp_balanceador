@@ -23,9 +23,22 @@ import urllib.request
 from collections import Counter
 
 
+def desenvolver(datos):
+    """Saca el contenido del sobre {"Code": …, "contenido": {…}}.
+
+    El código HTTP ya viaja aparte en la tupla de `pedir`, así que acá abajo
+    sólo interesa el contenido. Si la respuesta no viene envuelta se devuelve
+    tal cual: sirve para apuntar el verificador a un balanceador viejo, o a una
+    réplica directo, sin que el script explote.
+    """
+    if isinstance(datos, dict) and "Code" in datos and "contenido" in datos:
+        return datos["contenido"]
+    return datos
+
+
 def pedir(url, metodo="GET", cuerpo=None, timeout=10):
-    """Devuelve (codigo, json_o_None, segundos). Un error HTTP no es excepción:
-    un 503 es un dato del experimento, no un accidente del script."""
+    """Devuelve (codigo, contenido_o_None, segundos). Un error HTTP no es
+    excepción: un 503 es un dato del experimento, no un accidente del script."""
     datos = json.dumps(cuerpo).encode() if cuerpo is not None else None
     pedido = urllib.request.Request(
         url, data=datos, method=metodo,
@@ -33,13 +46,16 @@ def pedir(url, metodo="GET", cuerpo=None, timeout=10):
     arranque = time.perf_counter()
     try:
         with urllib.request.urlopen(pedido, timeout=timeout) as r:
-            return r.status, json.loads(r.read() or b"null"), time.perf_counter() - arranque
+            return (r.status, desenvolver(json.loads(r.read() or b"null")),
+                    time.perf_counter() - arranque)
     except urllib.error.HTTPError as e:
         try:
-            return e.code, json.loads(e.read() or b"null"), time.perf_counter() - arranque
+            return (e.code, desenvolver(json.loads(e.read() or b"null")),
+                    time.perf_counter() - arranque)
         except ValueError:
             return e.code, None, time.perf_counter() - arranque
     except Exception as e:
+        # Esto no vino del servidor: no hay sobre que abrir.
         return 0, {"error": str(e)}, time.perf_counter() - arranque
 
 

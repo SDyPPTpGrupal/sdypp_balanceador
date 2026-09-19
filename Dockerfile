@@ -1,13 +1,17 @@
-# Imagen del balanceador. Multi-etapa: grpcio-tools pesa 8 MB y sólo hace falta
-# para generar los stubs, así que se queda en la etapa builder.
+# Imagen del balanceador. Multi-etapa: pip y sus wheels se quedan en la etapa
+# builder y a la final sólo pasa lo instalado.
+#
+# Ya no se generan los stubs de contrato.proto: desde que los workers viven en
+# las réplicas, el balanceador no le hace ningún RPC de negocio a nadie. Lo
+# único que le queda de gRPC es `grpc.health.v1.Health` para preguntar si una
+# réplica sigue viva, y eso viene en grpcio-health-checking. `contrato.proto`
+# queda en el repo porque sigue siendo el contrato que implementan las réplicas,
+# pero este contenedor no lo necesita.
 
 FROM python:3.13-slim AS builder
 WORKDIR /build
-COPY requirements.txt requirements-build.txt ./
-RUN pip install --no-cache-dir --prefix=/instalado -r requirements.txt && \
-    pip install --no-cache-dir -r requirements-build.txt
-COPY contrato.proto ./
-RUN python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. contrato.proto
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --prefix=/instalado -r requirements.txt
 
 
 FROM python:3.13-slim
@@ -25,8 +29,7 @@ WORKDIR /app
 RUN useradd --create-home --uid 1000 balanceador
 
 COPY --from=builder /instalado /usr/local
-COPY --from=builder /build/contrato_pb2.py /build/contrato_pb2_grpc.py ./
-COPY app/balanceador.py ./
+COPY app/balanceador.py app/clientecola.py ./
 
 RUN mkdir -p /app/logs && chown -R balanceador:balanceador /app
 USER balanceador
@@ -34,16 +37,24 @@ USER balanceador
 ENV BA_PUERTO=8080 \
     BA_PUERTO_ADMIN=8081 \
     BA_ADMIN_BIND=127.0.0.1 \
+    BA_COLA_URL=http://127.0.0.1:8085 \
     BA_LOGS=/app/logs \
     PYTHONUNBUFFERED=1
 
-# Sólo se publica el puerto público. El de administración escucha en loopback y
-# no se expone: el CI/CD lo alcanza porque comparte la red del host.
+# Sólo se publica el puerto público. El de administración escucha en loopback:
+# el CD corre en la misma máquina, también con --network host, y llega por
+# 127.0.0.1:8081. Abrirlo (BA_ADMIN_BIND + BA_ADMIN_IPS) es sólo para un
+# balanceador que corra en otra casa.
 EXPOSE 8080
 
-# Se chequea a sí mismo: 200 mientras tenga al menos una réplica en rotación.
+# Se chequea a sí mismo: 200 mientras alcance la cola y tenga al menos una
+# réplica sana. Las dos cosas hacen falta — sin cola no se atiende nada, aunque
+# las réplicas estén perfectas.
+# El puerto sale de BA_PUERTO y no va fijo: con el puerto hardcodeado, levantar el
+# balanceador en otro puerto lo deja marcado unhealthy aunque esté sirviendo bien,
+# y eso en una demo se confunde con una caída de verdad.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health',timeout=2).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; p=os.environ.get('BA_PUERTO','8080'); sys.exit(0 if urllib.request.urlopen(f'http://localhost:{p}/health',timeout=2).status==200 else 1)"
 
 STOPSIGNAL SIGTERM
 
