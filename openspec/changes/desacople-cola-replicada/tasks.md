@@ -402,95 +402,95 @@ New module against a fake cluster; nothing imports it yet.
 
 ### 5a — `ClienteReplica` implementation
 
-- [ ] 5.1 (RED) Create `sdypp_balanceador/app/clientereplica.py` test scaffolding in
+- [x] 5.1 (RED) Create `sdypp_balanceador/app/clientereplica.py` test scaffolding in
       `tests/test_clientereplica.py` (unit-level, scripted stand-in servers): construct
       `ClienteReplica(["http://127.0.0.1:PORT"], token="t")` with a single-element seed list and
       confirm it operates against that one node. (Spec `queue-client-failover` — Constructor
       Accepts a Seed List.) — ~20 lines.
-- [ ] 5.2 (RED) Write cold-start discovery tests: first probed node reporting `rol: "master"` is
+- [x] 5.2 (RED) Write cold-start discovery tests: first probed node reporting `rol: "master"` is
       cached without probing the rest; a slave reporting `masterConocido` is followed; every node
       reporting `masterConocido: null` leaves nothing cached and falls through to backoff. (Spec
       `queue-client-failover` — Cold-Start Master Discovery, all three scenarios.) — ~45 lines.
-- [ ] 5.3 (RED) Write the steady-state no-extra-probes test: 100 consecutive `tomar_respuesta`
+- [x] 5.3 (RED) Write the steady-state no-extra-probes test: 100 consecutive `tomar_respuesta`
       calls against a cached master issue zero `/health` probes. (Spec `queue-client-failover` —
       Cached Master Used at Zero Discovery Cost, scenario "Steady-state operation issues no extra
       health probes".) — ~20 lines.
-- [ ] 5.4 (RED) Write the one-shot-redirect test: a stale cached master returns `421` with a
+- [x] 5.4 (RED) Write the one-shot-redirect test: a stale cached master returns `421` with a
       `master` URL, the client retries the identical operation exactly once at the new location
       and returns that result with no further redirect attempts; a second `421` on the retry falls
       back to full seed-list discovery with backoff, never loops. (Spec `queue-client-failover` —
       One-Shot Redirect Following, all three scenarios.) — ~45 lines.
-- [ ] 5.5 (RED — threat matrix: Redirect following) Write the redirect-target-allowlist test: a
+- [x] 5.5 (RED — threat matrix: Redirect following) Write the redirect-target-allowlist test: a
       `421` with `"master": "http://evil:8085"` (not in the static seed list) is ignored, treated
       as `master: null`, and no request is ever sent to that host — discovery runs instead. —
       ~25 lines.
-- [ ] 5.6 (RED — threat matrix: Redirect loop) Write the mutual-`421`-pair test: two nodes each
+- [x] 5.6 (RED — threat matrix: Redirect loop) Write the mutual-`421`-pair test: two nodes each
       redirect to the other; the client's request count stays bounded, then it surfaces `503`, no
       unbounded loop. — ~25 lines.
-- [ ] 5.7 (RED) Write the connection-failure test: a connection reset while contacting the cached
+- [x] 5.7 (RED) Write the connection-failure test: a connection reset while contacting the cached
       master invalidates the cache and triggers a fresh discovery probe, distinct from `421`
       handling; a fresh-connection failure with unknown delivery status is never blindly retried —
       it surfaces the same way `ErrorCola` already does, preserving the reused-connection-only
       retry rule. (Spec `queue-client-failover` — Connection Failure Triggers Re-Discovery, both
       scenarios.) — ~35 lines.
-- [ ] 5.8 (RED) Write the leaderless-backoff test: every seed node reports no known master;
+- [x] 5.8 (RED) Write the leaderless-backoff test: every seed node reports no known master;
       discovery retries with backoff (sleeps, not busy-loop), giving up with `503` once the
       caller's budget is exhausted. (Spec `queue-client-failover` — Backoff While the Cluster Is
       Leaderless, both scenarios.) — ~30 lines.
-- [ ] 5.9 (RED) Write the never-writes-to-a-known-slave test: a node previously learned as `rol:
+- [x] 5.9 (RED) Write the never-writes-to-a-known-slave test: a node previously learned as `rol:
       "slave"` (via a prior `/health` probe or a prior `421`) is never targeted directly for a
       mutating write. (Spec `queue-client-failover` — Never Writes to a Known Slave.) — ~20 lines.
-- [ ] 5.10 Verify RED: run `./.venv/bin/python -m unittest discover -s tests -v`; confirm 5.1–5.9
+- [x] 5.10 Verify RED: run `./.venv/bin/python -m unittest discover -s tests -v`; confirm 5.1–5.9
       fail with `ModuleNotFoundError` (`app.clientereplica` does not exist yet).
-- [ ] 5.11 (GREEN) Implement `ClienteReplica.__init__(urls, token="", timeout=5.0, conexiones=8,
+- [x] 5.11 (GREEN) Implement `ClienteReplica.__init__(urls, token="", timeout=5.0, conexiones=8,
       backoff_inicial=0.1, backoff_maximo=1.0, presupuesto=5.0)`: one lazily-created, cached
       `ClienteCola` per seed URL, `_master: str | None` guarded by a `threading.Lock`. Run test 5.1
       to green. — ~35 lines.
-- [ ] 5.12 (GREEN) Implement cold-start discovery: sequential `GET /health` over the seed list
+- [x] 5.12 (GREEN) Implement cold-start discovery: sequential `GET /health` over the seed list
       starting at a rotating offset, first `rol == "master"` or usable `masterConocido` wins. Run
       test 5.2 to green. — ~40 lines.
-- [ ] 5.13 (GREEN) Implement the cached-master fast path for `publicar_pedido`/`tomar_respuesta`.
+- [x] 5.13 (GREEN) Implement the cached-master fast path for `publicar_pedido`/`tomar_respuesta`.
       Run test 5.3 to green. — ~15 lines.
-- [ ] 5.14 (GREEN) Implement one-shot redirect following with the seed-list allowlist check on the
+- [x] 5.14 (GREEN) Implement one-shot redirect following with the seed-list allowlist check on the
       `master` field (unknown target → treated as `null`), and the bounded-loop fallback to
       discovery. Run tests 5.4, 5.5, 5.6 to green. — ~50 lines.
-- [ ] 5.15 (GREEN) Implement connection-failure handling: invalidate cache + re-discover, and
+- [x] 5.15 (GREEN) Implement connection-failure handling: invalidate cache + re-discover, and
       surface `ErrorCola` for a fresh-connection failure without re-sending. Run test 5.7 to green.
       — ~25 lines.
-- [ ] 5.16 (GREEN) Implement leaderless backoff (`0.1s` doubling to `1.0s` cap, `±20%` jitter,
+- [x] 5.16 (GREEN) Implement leaderless backoff (`0.1s` doubling to `1.0s` cap, `±20%` jitter,
       budget-bounded) and the never-write-to-a-known-slave guard. Run tests 5.8, 5.9 to green. —
       ~30 lines.
-- [ ] 5.17 (GREEN) `app/clientecola.py`: add an explicit `ErrorCola.enviado` attribute; change
+- [x] 5.17 (GREEN) `app/clientecola.py`: add an explicit `ErrorCola.enviado` attribute; change
       `tomar_respuesta()` to stop collapsing every non-200 into `None` — return `(codigo, datos)`
       and let `ClienteReplica` decide. Confirm `clientecola.py`'s own tests still pass unchanged.
       — ~25 lines.
-- [ ] 5.18 (REFACTOR) Confirm `ClienteReplica` never rewrites `_pedir`'s retry rule (Decision 10) —
+- [x] 5.18 (REFACTOR) Confirm `ClienteReplica` never rewrites `_pedir`'s retry rule (Decision 10) —
       it is a routing layer strictly above the unchanged transport. Re-run full test file green.
-- [ ] 5.19 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — all of
+- [x] 5.19 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — all of
       `tests/test_clientereplica.py` green; suite count still at or above 100 (this module is
       additive and unreferenced elsewhere so far).
 
 ### 5b — Fake-cluster integration tests
 
-- [ ] 5.20 (RED) Create `sdypp_balanceador/tests/test_cluster_cola.py`: minimal scripted
+- [x] 5.20 (RED) Create `sdypp_balanceador/tests/test_cluster_cola.py`: minimal scripted
       `http.server` fake nodes. Test cold-start discovery against a fake 3-node cluster with
       canned `/health` bodies. — ~50 lines.
-- [ ] 5.21 (RED) Test that `421` is followed exactly once with the POST body sent exactly once —
+- [x] 5.21 (RED) Test that `421` is followed exactly once with the POST body sent exactly once —
       the fake asserts on received-body count, which is the actual no-duplication check. (Spec
       `queue-client-failover` — scenario "A 421 never causes a duplicated write".) — ~45 lines.
-- [ ] 5.22 (RED) Test that all-slaves-reachable-no-master produces bounded backoff request count
+- [x] 5.22 (RED) Test that all-slaves-reachable-no-master produces bounded backoff request count
       in a fixed window, and whole-cluster-down produces `503` with near-zero request rate over
       that window. — ~45 lines.
-- [ ] 5.23 (RED) Test that `/pedidos/tomar` is never sent to a fake node scripted to answer `rol:
+- [x] 5.23 (RED) Test that `/pedidos/tomar` is never sent to a fake node scripted to answer `rol:
       "slave"`. — ~25 lines.
-- [ ] 5.24 Verify RED: run the new file; confirm it fails only where the fake-server scaffolding
+- [x] 5.24 Verify RED: run the new file; confirm it fails only where the fake-server scaffolding
       itself has bugs, not where `ClienteReplica` (already green from 5a) is missing behaviour.
-- [ ] 5.25 (GREEN) Fix any fake-server scaffolding gaps surfaced by 5.20–5.23; these tests should
+- [x] 5.25 (GREEN) Fix any fake-server scaffolding gaps surfaced by 5.20–5.23; these tests should
       mostly go green immediately given 5a is already implemented — this file is primarily an
       integration confirmation, not new production code. — ~10 lines (scaffolding fixes only).
-- [ ] 5.26 (REFACTOR) Ensure `test_cluster_cola.py`'s fake servers are torn down deterministically
+- [x] 5.26 (REFACTOR) Ensure `test_cluster_cola.py`'s fake servers are torn down deterministically
       (no leaked threads/sockets between test cases).
-- [ ] 5.27 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — full suite green,
+- [x] 5.27 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — full suite green,
       count at or above 100.
 
 ---
