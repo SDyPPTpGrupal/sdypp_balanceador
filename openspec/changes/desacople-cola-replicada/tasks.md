@@ -69,21 +69,22 @@ change's scope and is a separate future decision.
 
 External deliverable, blocks nothing else, ships and is announced first.
 
-- [ ] 1.1 Update `docs/contrato-worker.md`: collapse the "⚠ Colisión de códigos" box to a plain
+- [x] 1.1 Update `docs/contrato-worker.md`: collapse the "⚠ Colisión de códigos" box to a plain
       two-row table, remove the "decisión pendiente" note, and change the pseudocode branch
       `codigo == 409 and respuesta.get("error") == "no-soy-master"` to `codigo == 421`. No other
       wording changes. — ~15 lines changed.
-- [ ] 1.2 Update `docs/plan-cola-desacoplada.md`: apply the same `409 no-soy-master` → `421` change
+- [x] 1.2 Update `docs/plan-cola-desacoplada.md`: apply the same `409 no-soy-master` → `421` change
       across Regla 1, the master-discovery table, the `CONTRATO.md` section, and every route
       listing that mentions the old code. — ~35 lines changed.
-- [ ] 1.3 Verify: `git diff` shows no remaining literal `409` next to `no-soy-master` in either
+- [x] 1.3 Verify: `git diff` shows no remaining literal `409` next to `no-soy-master` in either
       file, and no "decisión pendiente" string remains. Both files still reference the two
       unaffected `409` meanings on `/respuestas` (`desconocido`, `destinatario-saturado`) unchanged.
       (Spec: `queue-service-api` — Contract Version Declaration Stays 1.0, scenario "The two
       /respuestas 409 meanings are unaffected".)
-- [ ] 1.4 Announce to the worker team that slice 1 has merged and `421` replaces `409
+- [x] 1.4 Announce to the worker team that slice 1 has merged and `421` replaces `409
       no-soy-master`, per the proposal's Dependencies section (not a code task, but a recorded
-      delivery step).
+      delivery step). Recorded here as the delivery step; actual team notification is an
+      out-of-band action for the user to perform once this slice is merged/pushed.
 
 ---
 

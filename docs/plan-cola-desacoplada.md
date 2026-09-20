@@ -63,7 +63,7 @@ Lo que se paga, y hay que decirlo en el informe:
 
 **Regla 1 — sólo se escribe y se lee contra el master.** `/pedidos`, `/pedidos/tomar`,
 `/pedidos/devolver`, `/respuestas`, `/respuestas/tomar` van siempre al master vigente. Un nodo que
-no es master devuelve `409 {"error": "no-soy-master", "master": "<url o null>"}` y el cliente
+no es master devuelve `421 {"error": "no-soy-master", "master": "<url o null>"}` y el cliente
 reintenta contra la URL indicada (o descubre uno nuevo si viene `null`, ver más abajo).
 
 **Regla 2 — una entrada del log recién se aplica y se confirma cuando la tiene la mayoría.** El
@@ -80,7 +80,7 @@ nuevos circulando y deja de aceptar escrituras.
 
 **Regla 4 — nada de nginx ni de un balanceador HTTP adelante del clúster de colas.** El balanceador
 y los workers hablan directo con los nodos y siguen al líder ellos mismos; un proxy round-robin
-mandaría escrituras a un slave al azar, que las va a rechazar con `409`, o peor, las aceptaría si el
+mandaría escrituras a un slave al azar, que las va a rechazar con `421`, o peor, las aceptaría si el
 proxy no entiende el protocolo. Esto va escrito en el README.
 
 ### Descubrimiento del master — cómo llegan el balanceador y los workers al clúster
@@ -102,8 +102,8 @@ Le pega a cualquiera y resuelve por una de dos vías, que se complementan:
 
 | Vía | Cómo | Cuándo conviene |
 | :--- | :--- | :--- |
-| **Preguntar** | `GET /health` a cualquier nodo vivo → `{"rol": "slave", "masterConocido": "http://cola-2:8085"}` | arranque en frío, o cuando el `409` vino con `master: null` |
-| **Ir directo y comerse el redirect** | manda la operación a quien sea; si le tocó un slave recibe `409 {"error":"no-soy-master","master":"..."}` y reintenta ahí | régimen normal: en el camino feliz no cuesta ningún round trip extra |
+| **Preguntar** | `GET /health` a cualquier nodo vivo → `{"rol": "slave", "masterConocido": "http://cola-2:8085"}` | arranque en frío, o cuando el `421` vino con `master: null` |
+| **Ir directo y comerse el redirect** | manda la operación a quien sea; si le tocó un slave recibe `421 {"error":"no-soy-master","master":"..."}` y reintenta ahí | régimen normal: en el camino feliz no cuesta ningún round trip extra |
 
 #### Régimen estable: costo cero
 
@@ -137,7 +137,7 @@ Está cubierto, y por una razón que vale la pena explicitar: **`tomar` pasa por
 replicación** (regla 2), y el zombi no puede comprometer nada porque para eso necesita ack de
 mayoría, y la mayoría ya se movió a un término nuevo. Entonces no entrega el pedido: falla. Y en su
 primer contacto con cualquier otro nodo ve el término mayor y se retracta a slave (regla 3), con lo
-que empieza a contestar `409 no-soy-master` y el cliente se redirige solo.
+que empieza a contestar `421 no-soy-master` y el cliente se redirige solo.
 
 El detalle fino: la decisión de meter `tomar` en el log —que a primera vista parece burocracia— es
 justamente lo que hace **segura** una lectura contra un master obsoleto. Si `tomar` se resolviera
@@ -268,15 +268,15 @@ class ClienteReplica:
 ```
 
 **Descubrir al master**: el cliente guarda el último master que le funcionó. Si la request le da
-`409 no-soy-master` con un `master` en el cuerpo, actualiza y reintenta ahí mismo (una sola vez). Si
-no tiene ningún master conocido (arranque en frío, o el `409` vino con `master: null` porque el
+`421 no-soy-master` con un `master` en el cuerpo, actualiza y reintenta ahí mismo (una sola vez). Si
+no tiene ningún master conocido (arranque en frío, o el `421` vino con `master: null` porque el
 clúster está en elección), hace un *probe* secuencial de los N nodos preguntando `/health` hasta
 encontrar uno que diga `"rol": "master"`. Si ninguno lo es, el clúster está sin líder: se reintenta
 con backoff hasta el `presupuestoMs` del pedido.
 
 **El failover, igual que antes distingue si el POST llegó a escribirse o no** (mismo criterio de
 `ErrorCola.enviado` que ya existe en `app/clientecola.py:87-101`), pero ahora la consecuencia es
-distinta: si falló por conexión, se reintenta el *probe* de master; si falló por `409 no-soy-master`,
+distinta: si falló por conexión, se reintenta el *probe* de master; si falló por `421 no-soy-master`,
 se sigue directo al master indicado sin duplicar el POST.
 
 Si el clúster entero no responde o está en elección más allá del presupuesto: `503
@@ -288,7 +288,7 @@ Si el clúster entero no responde o está en elección más allá del presupuest
 por instancia, como en la propuesta de partición): sólo hay un master del que recolectar en cada
 momento, y el cliente ya sabe encontrarlo.
 
-> **Mismo bug a evitar que en la propuesta anterior.** Si el nodo contactado devuelve `503` o `409`
+> **Mismo bug a evitar que en la propuesta anterior.** Si el nodo contactado devuelve `503` o `421`
 > (no un corte de conexión), la respuesta a `tomar_respuesta` no puede tratarse como "no había nada"
 > (`204`): hay que distinguirlo y aplicar `time.sleep(ESPERA_REINTENTO)` antes de reintentar, o se
 > genera un bucle cerrado contra un clúster que está en elección.
@@ -363,7 +363,7 @@ Lo que sí es nuevo es la respuesta cuando el nodo contactado no es el master.
 ### Cualquier ruta de datos, contra un nodo que no es master
 
 ```jsonc
-// ← 409
+// ← 421
 {"error": "no-soy-master", "master": "http://cola-2:8085"}   // o "master": null si está en elección
 ```
 
@@ -381,7 +381,7 @@ El publicador/consumidor reintenta contra `master` sin duplicar el POST original
  "presupuestoMs": 5000}
 // ← 202 {"id", "encolado": true} — sólo después de comprometer la entrada en mayoría del clúster
 // ← 503 {"error": "cola llena", "esperando": 100, "cota": 100}
-// ← 409 no-soy-master (ver arriba)
+// ← 421 no-soy-master (ver arriba)
 ```
 
 ### Pull del pedido — `POST /pedidos/tomar` (lo consume el worker, contra el master)
@@ -397,7 +397,7 @@ réplica del worker.
  "quedaMs": 4870,
  "intento": 1}
 // ← 204 sin cuerpo. No había trabajo.
-// ← 409 no-soy-master
+// ← 421 no-soy-master
 ```
 
 **Ningún instante absoluto viaja en ninguna dirección**, sólo `quedaMs`, calculado con el reloj del
@@ -410,7 +410,7 @@ pedido original.
 
 `202 {"resultado":"entregada"}` (comprometido en mayoría antes de contestar) ·
 `409 {"resultado":"desconocido"}` (ya la contestó otro — no reintentar) ·
-`409 {"resultado":"destinatario-saturado"}` · `409 no-soy-master`.
+`409 {"resultado":"destinatario-saturado"}` · `421 no-soy-master`.
 
 ### Pull de la respuesta — `POST /respuestas/tomar` (lo consume el balanceador, contra el master)
 
@@ -449,7 +449,7 @@ y checklist de aceptación. Es autocontenido a propósito — ese equipo no nece
 semanas los dos textos dicen cosas distintas y nadie sabe cuál vale.
 
 Resumen de una línea para quien lee este plan: el worker habla **directo** con el clúster (no por el
-balanceador), arranca con una seed list, descubre y cachea el master, sigue el `409 no-soy-master`
+balanceador), arranca con una seed list, descubre y cachea el master, sigue el `421 no-soy-master`
 cuando cambia, y **no implementa nada de Raft**.
 
 ---
@@ -477,7 +477,7 @@ nuevo master retoma los pedidos ya comprometidos.
   log desactualizado no puede ganar; fencing — un nodo con término viejo se retracta al ver uno
   nuevo; no puede haber dos masters simultáneos incluso con partición de red simulada.
 - `tests/test_cluster_cola.py` (repo del balanceador, clúster de mentira): el `ClienteReplica`
-  encuentra al master en frío; sigue el `409 no-soy-master` sin duplicar el POST; reintenta con
+  encuentra al master en frío; sigue el `421 no-soy-master` sin duplicar el POST; reintenta con
   backoff si el clúster está sin líder; nunca manda `/pedidos/tomar` a un nodo que contestó
   `"rol": "slave"`.
 - `tests/test_servidor_cola.py`: se agrega que un `202` sólo sale después de que el log tiene
@@ -492,6 +492,6 @@ nuevo master retoma los pedidos ya comprometidos.
 | 1 | matar al master con pedidos ya confirmados (`202`) en vuelo | ninguno se pierde: el nuevo master los tiene y los entrega |
 | 2 | matar al master con un `POST /pedidos` en curso que **todavía no** llegó a mayoría | ese pedido puntual se pierde; el cliente ve el error de conexión y puede reintentar (no es idempotente automáticamente) |
 | 3 | partición de red que aísla al master viejo con un slave (minoría) | el viejo master deja de poder comprometer nada (no tiene mayoría) y dentro de `RAFT_ELECCION_TIMEOUT_MS` el lado con mayoría elige uno nuevo; al sanar la partición, el viejo master ve el término nuevo y se retracta a slave sin haber aceptado escrituras huérfanas |
-| 4 | **master zombi**: revivir al master viejo mientras un worker todavía tiene su URL cacheada | el zombi no puede comprometer el `tomar` (no junta mayoría, el término quedó viejo), así que no entrega nada; se retracta a slave al primer contacto y empieza a contestar `409 no-soy-master`, con lo que el worker se redirige solo |
+| 4 | **master zombi**: revivir al master viejo mientras un worker todavía tiene su URL cacheada | el zombi no puede comprometer el `tomar` (no junta mayoría, el término quedó viejo), así que no entrega nada; se retracta a slave al primer contacto y empieza a contestar `421 no-soy-master`, con lo que el worker se redirige solo |
 | 5 | levantar de nuevo un slave caído | se resincroniza el log solo (catch-up de las entradas que le faltan) |
 | 6 | apagar todo el clúster | 503 "el sistema de colas no responde"; CPU del balanceador **y de los workers** cerca de cero (backoff, no bucle cerrado) |

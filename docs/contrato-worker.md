@@ -14,12 +14,12 @@
 | :--- | :--- | :--- |
 | Nodos de cola | **uno solo** | clúster de 3+ (impar) con master/slave |
 | Rutas de datos | ya funcionan tal cual están acá | sin cambios |
-| `409 no-soy-master` | nunca lo devuelve | lo devuelve cualquier nodo que no sea master |
+| `421 no-soy-master` | nunca lo devuelve | lo devuelve cualquier nodo que no sea master |
 | Descubrimiento | innecesario (una URL fija) | seed list + `/health` |
 
 **Podés desarrollar y probar hoy mismo, en paralelo, sin esperar al clúster.** Si implementás el
 worker como dice este documento y lo corrés contra el nodo único actual con una seed list de **un**
-elemento, funciona igual: el nodo nunca contesta `409 no-soy-master`, así que la rama de
+elemento, funciona igual: el nodo nunca contesta `421 no-soy-master`, así que la rama de
 redescubrimiento simplemente no se ejecuta. Cuando el clúster esté, el worker ya está listo y no hay
 que tocarlo.
 
@@ -134,35 +134,31 @@ hacer — nadie puede inventar un master que todavía no fue electo.
 Con la URL cacheada, cada `tomar` y cada `responder` es un POST directo. **No preguntes `/health`
 antes de cada operación**: el descubrimiento ocurre sólo al arrancar y cuando algo se rompe.
 
-### El `409 no-soy-master`
+### El `421 no-soy-master`
 
 Si le pegás a un nodo que no es el master (porque cambió y tu caché quedó viejo):
 
 ```jsonc
-// ← 409
+// ← 421
 {"error": "no-soy-master", "master": "http://100.101.15.93:8086"}   // o "master": null
 ```
 
 Qué hacer: actualizá el caché con esa URL y **reintentá una vez** ahí. Si viene `master: null`,
 volvé a la seed list con backoff.
 
-> ### ⚠ Colisión de códigos: hay dos `409` distintos
+> ### Códigos: `421` no comparte espacio con los `409` de `/respuestas`
 >
-> `POST /respuestas` ya usaba `409` para otra cosa. **Distinguí por el cuerpo, no por el status:**
+> `POST /respuestas` usa `409` para dos casos propios, distintos del redirect. **Igual, distinguí
+> por el cuerpo, no sólo por el status:**
 >
 > | Cuerpo | Significa | Qué hacer |
 > | :--- | :--- | :--- |
-> | `{"error": "no-soy-master", ...}` | le pegaste al nodo equivocado | actualizar caché y reintentar |
 > | `{"resultado": "desconocido"}` | el pedido ya lo contestó otro | **descartar, no reintentar** |
 > | `{"resultado": "destinatario-saturado"}` | el balanceador no recolecta | descartar o reintentar más tarde |
 >
-> Confundir el primero con el segundo hace que descartes respuestas válidas. Chequeá la clave
-> `error` antes que nada.
->
-> **Decisión pendiente de la reunión**: proponemos cambiar `no-soy-master` a **`421 Misdirected
-> Request`**, que semánticamente es exactamente eso ("le pediste a un servidor que no puede
-> responder esto") y elimina la colisión. Si se aprueba, es el único cambio que impacta este
-> documento. Codificá la detección por cuerpo y el cambio te sale gratis.
+> El redirect (`421 {"error": "no-soy-master", ...}`) ya tiene status propio, así que nunca se
+> confunde con estos dos. Pero los dos casos de arriba siguen compartiendo `409` entre sí, así que
+> seguí chequeando la clave del cuerpo (`resultado`) antes de decidir qué hacer.
 
 ### Cuando cae el master
 
@@ -196,7 +192,7 @@ bucle cerrado sin dormir: con el clúster caído, eso te pone la CPU al 100%.
  "intento": 1}                  // 2 o más = a este pedido ya lo abandonó otra réplica
 
 // ← 204 sin cuerpo. No había trabajo en esos segundos. Volvé a llamar.
-// ← 409 {"error": "no-soy-master", "master": "..."}
+// ← 421 {"error": "no-soy-master", "master": "..."}
 ```
 
 **No viaja ningún instante absoluto, sólo `quedaMs`.** Los relojes de las distintas máquinas no
@@ -216,7 +212,7 @@ descartaría pedidos vivos. `quedaMs` se calcula con el reloj de la cola, que es
 // ← 202 {"resultado": "entregada"}
 // ← 409 {"resultado": "desconocido"}           ya lo contestó otro: descartá, no reintentes
 // ← 409 {"resultado": "destinatario-saturado"} el balanceador no está recolectando
-// ← 409 {"error": "no-soy-master", "master": "..."}
+// ← 421 {"error": "no-soy-master", "master": "..."}
 ```
 
 **No mandes `destinatario`: lo pone la cola** con lo que guardó del pedido. El worker no tiene por
@@ -229,7 +225,7 @@ respuesta ajena.
 // →  {"id": "4b7baf0d…", "consumidor": "100.91.134.43:8080"}
 // ← 200 {"resultado": "devuelto"}
 // ← 409 {"resultado": "no-estaba-en-vuelo"}   la reserva ya venció; no hagas nada
-// ← 409 {"error": "no-soy-master", "master": "..."}
+// ← 421 {"error": "no-soy-master", "master": "..."}
 ```
 
 Para cuando la réplica se apaga: devolvé lo que tenés en la mano en vez de hacer esperar los
@@ -336,9 +332,9 @@ def pedir(ruta, cuerpo):
             master = None                    # se cayó: redescubrir
             continue
 
-        if codigo == 409 and respuesta.get("error") == "no-soy-master":
+        if codigo == 421:
             master = respuesta.get("master")  # puede ser None
-            continue                          # ojo: chequear `error`, no el status
+            continue
         return codigo, respuesta
     return None, None
 
@@ -423,5 +419,6 @@ declara en `/health`. Así, subir de versión no obliga a reconfigurar la URL de
 ## Contacto y cambios
 
 Cualquier cosa de este contrato que no cierre, preguntala **antes** de implementar: un supuesto
-distinto de los dos lados sale carísimo. La única decisión abierta hoy es la del `421` vs `409` para
-`no-soy-master`, marcada arriba.
+distinto de los dos lados sale carísimo. La decisión sobre `no-soy-master` ya está resuelta: usa
+`421 Misdirected Request`, marcado arriba. Seguí distinguiendo por el cuerpo de la respuesta, no
+sólo por el status: `409` sigue teniendo dos significados propios en `/respuestas`.
