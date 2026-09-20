@@ -77,10 +77,11 @@ En `servidor.py`:
 
 - `COLA_INSTANCIA` nueva (default: `f"{NOMBRE}-{PUERTO}@{CASA}"`). Sale en `/health`, en `/estado`,
   en cada pedido y en la bitácora.
-- **Prefijo `/v1/` en las cinco rutas de negocio**, con las rutas sin prefijo mantenidas como alias
-  (el diccionario `rutas` de `cola/servidor.py:336` acepta las dos formas). La versión en la URL y no
-  en un header: se ve en la bitácora, en el `curl` de la demo y en el log de acceso sin inspeccionar
-  nada, y el worker lo escribe otro integrante posiblemente en otro lenguaje.
+- **Versión de contrato declarada y verificada en caliente.** `GET /health` devuelve
+  `"contrato": "1.0"`; el cliente declara `VERSION_CONTRATO` y el vigilante del anillo compara el
+  **major** contra cada instancia: si difiere, la marca no-apta y lo grita en la bitácora. Se prefiere
+  esto a un prefijo `/v1/` en las rutas porque no obliga a tocar la URL que ya tiene configurada el
+  worker, y porque lo que importa no es qué archivo tenés sino contra qué versión estás hablando.
 - **Partir el token en dos**: `COLA_TOKEN_PUBLICADOR` (balanceador: `/pedidos`, `/respuestas/tomar`,
   `/estado`) y `COLA_TOKEN_CONSUMIDOR` (workers: `/pedidos/tomar`, `/pedidos/devolver`,
   `/respuestas`). `COLA_TOKEN` se sigue aceptando como comodín para no romper lo ya escrito. Ahora
