@@ -349,6 +349,11 @@ while True:
         continue
     if codigo == 204:             # no había trabajo; el long-poll ya esperó
         continue
+    if codigo != 200:             # 403 token inválido, 5xx, cualquier otra cosa
+        # NUNCA caer acá sin dormir: sin backoff esto es un bucle cerrado.
+        registrar(f"/pedidos/tomar devolvió {codigo}: {pedido}")
+        dormir_con_backoff()
+        continue
 
     timeout = pedido["quedaMs"] / 1000        # NO usar un timeout fijo
     try:
