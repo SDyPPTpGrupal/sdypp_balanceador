@@ -501,56 +501,56 @@ The cutover. Reversible by env var until `cola/` is removed.
 
 ### 6a — Wiring
 
-- [ ] 6.1 (RED) Write the `BA_COLA_URL` comma-split test: a three-URL value produces a 3-element
+- [x] 6.1 (RED) Write the `BA_COLA_URL` comma-split test: a three-URL value produces a 3-element
       seed list passed to `ClienteReplica`; a single URL (no commas) produces a one-element seed
       list and operates identically to pre-change behaviour. (Spec
       `balanceador-queue-integration` — BA_COLA_URL Accepts a Comma-Separated Seed List, both
       scenarios.) — ~25 lines.
-- [ ] 6.2 (RED) Write the `derivar()` never-lets-a-redirect-reach-the-caller test, and the
+- [x] 6.2 (RED) Write the `derivar()` never-lets-a-redirect-reach-the-caller test, and the
       exhausted-leaderless-budget-resolves-cleanly test (not a bare `502`). (Spec
       `balanceador-queue-integration` — derivar() Never Lets a Redirect Reach the Caller, both
       scenarios.) — ~35 lines.
-- [ ] 6.3 (RED) Write the `recolectar()` status-handling tests: `204` does not trigger backoff
+- [x] 6.3 (RED) Write the `recolectar()` status-handling tests: `204` does not trigger backoff
       sleep; `503`/`421` triggers `time.sleep(ESPERA_REINTENTO)` before retry; connection failure
       also triggers backoff, distinctly from `204`. (Spec `balanceador-queue-integration` —
       recolectar() Distinguishes 204, 503, 421, and Connection Failure, all three scenarios.) —
       ~40 lines.
-- [ ] 6.4 (RED) Write the `salud()` additive-fields tests: a healthy cluster reports
+- [x] 6.4 (RED) Write the `salud()` additive-fields tests: a healthy cluster reports
       `cola.estado: "sana"` with the master's `rol`/`termino`; an electing cluster reports
       `cola.estado: "eligiendo"`; a fully down cluster reports `cola.estado: "caída"`; an existing
       consumer reading only pre-existing fields is unaffected. (Spec
       `balanceador-queue-integration` — salud() Reports Additive Cluster Fields, all four
       scenarios.) — ~40 lines.
-- [ ] 6.5 Verify RED: run `./.venv/bin/python -m unittest discover -s tests -v`; confirm 6.1–6.4
+- [x] 6.5 Verify RED: run `./.venv/bin/python -m unittest discover -s tests -v`; confirm 6.1–6.4
       fail for the expected reason (`balanceador.py`/`consola.py` still on the single-URL,
       `ClienteCola` path).
-- [ ] 6.6 (GREEN) `app/balanceador.py`: parse `BA_COLA_URL` into a seed list (`:73`), construct
+- [x] 6.6 (GREEN) `app/balanceador.py`: parse `BA_COLA_URL` into a seed list (`:73`), construct
       `ClienteReplica(URLS, ...)` in place of `ClienteCola(COLA_URL, COLA_TOKEN)` (`:288`). Run
       test 6.1 to green. — ~25 lines.
-- [ ] 6.7 (GREEN) `app/balanceador.py`: rework `derivar()` (`:386-441`) so any code other than
+- [x] 6.7 (GREEN) `app/balanceador.py`: rework `derivar()` (`:386-441`) so any code other than
       `202`/`503` from `ClienteReplica` (which never leaks a raw `421`) resolves to a definitive
       outcome, never a generic `502` conflating "queue rejected" with "cluster leaderless". Run
       test 6.2 to green. — ~40 lines.
-- [ ] 6.8 (GREEN) `app/balanceador.py`: rework `recolectar()` (`:346-376`) to branch on `204` (no
+- [x] 6.8 (GREEN) `app/balanceador.py`: rework `recolectar()` (`:346-376`) to branch on `204` (no
       sleep) versus `503`/`421`/connection-failure (`time.sleep(ESPERA_REINTENTO)`). Run test 6.3
       to green. — ~30 lines.
-- [ ] 6.9 (GREEN) `app/balanceador.py`: extend `salud()`/`backends_json()` (`:550-604`, `:448-477`)
+- [x] 6.9 (GREEN) `app/balanceador.py`: extend `salud()`/`backends_json()` (`:550-604`, `:448-477`)
       with `cola.rol`/`cola.termino`/`cola.estado`/`cola.instancias`, purely additive. Run test 6.4
       to green. — ~35 lines.
-- [ ] 6.10 (GREEN) `consola.py` (`:100`, `:641`): generate a comma-separated seed list instead of a
+- [x] 6.10 (GREEN) `consola.py` (`:100`, `:641`): generate a comma-separated seed list instead of a
       single URL. Add or update a `consola.py`-side test confirming the generated `BA_COLA_URL`
       lists all cluster node URLs. (Spec `balanceador-queue-integration` — consola.py Generates a
       Seed List.) — ~20 lines.
-- [ ] 6.11 (REFACTOR) Confirm `ClienteCola` import is fully removed from `balanceador.py`'s
+- [x] 6.11 (REFACTOR) Confirm `ClienteCola` import is fully removed from `balanceador.py`'s
       construction path (still importable from `clientecola.py` itself, per the rollback plan);
       re-run full suite green.
-- [ ] 6.12 Verify: `./.venv/bin/python -m unittest discover -s tests` reports **at or above 100
+- [x] 6.12 Verify: `./.venv/bin/python -m unittest discover -s tests` reports **at or above 100
       tests passing** (spec `balanceador-queue-integration` — The Balanceador Suite Does Not
       Regress Below Its Baseline).
 
 ### 6b — Cleanup: remove the verified `cola/` duplicate
 
-- [ ] 6.13 Re-verify `cola/` has not drifted since exploration.md's confirmed byte-identical diff:
+- [x] 6.13 Re-verify `cola/` has not drifted since exploration.md's confirmed byte-identical diff:
       run `diff -rq sdypp_balanceador/cola sdypp_colas_serv/colas.py sdypp_colas_serv/servidor.py
       sdypp_colas_serv/Dockerfile` **is not the correct comparison at this point** — `colas_serv`
       has evolved through slices 2-4 (Raft additions) and is no longer byte-identical to the frozen
@@ -558,22 +558,22 @@ The cutover. Reversible by env var until `cola/` is removed.
       received **zero commits** since the subtree split (it was never touched by tasks 1.x–6.12),
       which is what makes it safe to delete as dead, unused, pre-Raft code rather than a
       still-diverging duplicate. — read-only verification, no lines changed.
-- [ ] 6.14 Confirm `cola/` is unreferenced: `grep -rn "^from cola\|^import cola\|from \.cola\b"
+- [x] 6.14 Confirm `cola/` is unreferenced: `grep -rn "^from cola\|^import cola\|from \.cola\b"
       sdypp_balanceador/app sdypp_balanceador/*.py` returns nothing — no remaining import anywhere
       in the balanceador codebase targets `cola/` (it was already superseded operationally by
       `ClienteReplica` talking to the standalone `sdypp_colas_serv` service in 6a). — read-only
       verification.
-- [ ] 6.15 Delete `sdypp_balanceador/cola/` (all files: `colas.py`, `servidor.py`, `Dockerfile`,
+- [x] 6.15 Delete `sdypp_balanceador/cola/` (all files: `colas.py`, `servidor.py`, `Dockerfile`,
       `README.md`, and any `__init__.py`). — this is a pure deletion, estimated ~900-1100 lines
       removed; **candidate for `size:exception`** given it introduces zero new logic to review.
-- [ ] 6.16 Delete `sdypp_balanceador/tests/test_colas.py` and
+- [x] 6.16 Delete `sdypp_balanceador/tests/test_colas.py` and
       `sdypp_balanceador/tests/test_servidor_cola.py` (both already relocated and evolved inside
       `sdypp_colas_serv/tests/` since task 2.1's window; see Phase 4's relocation note). —
       estimated ~300-400 lines removed.
-- [ ] 6.17 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — suite still reports at
+- [x] 6.17 Verify: `./.venv/bin/python -m unittest discover -s tests -v` — suite still reports at
       or above 100 passing tests with `cola/` and its tests gone; no `ModuleNotFoundError` for
       `cola.*` anywhere in the run.
-- [ ] 6.18 Update `docs/plan-cola-desacoplada.md` (or a short changelog note) to record that
+- [x] 6.18 Update `docs/plan-cola-desacoplada.md` (or a short changelog note) to record that
       Etapa 3 (repository split) is now fully closed — the duplicate is gone, not merely
       byte-identical.
 

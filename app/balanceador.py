@@ -53,7 +53,8 @@ import grpc
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from clientecola import ClienteCola, ErrorCola
+from clientecola import ErrorCola
+from clientereplica import ClienteReplica
 
 # --- Configuración ---------------------------------------------------------
 # Todo por entorno: la topología se decide el día de la demo sin tocar código.
@@ -68,9 +69,9 @@ NOMBRE = os.environ.get("BA_NOMBRE", "balanceador")
 # se lleva la respuesta que el otro está esperando.
 IDENTIDAD = os.environ.get("BA_IDENTIDAD", f"{NOMBRE}@{CASA}")
 
-# El sistema de colas. Vive en otro proceso —y puede vivir en otra máquina—, así
-# que es una URL y no un objeto en memoria.
+# El sistema de colas. Acepta una lista separada por comas (seed list del clúster).
 COLA_URL = os.environ.get("BA_COLA_URL", "http://127.0.0.1:8085")
+COLA_URLS = [u.strip() for u in COLA_URL.split(",") if u.strip()]
 COLA_TOKEN = os.environ.get("BA_COLA_TOKEN", "")
 
 # Backends iniciales, separados por coma: "salvador:8080,mateon:8080".
@@ -285,7 +286,7 @@ def normalizar_destino(x):
 
 
 POOL = Pool()
-CLIENTE = ClienteCola(COLA_URL, COLA_TOKEN)
+CLIENTE = ClienteReplica(COLA_URLS, token=COLA_TOKEN)
 
 
 def vigilar_salud():
@@ -356,14 +357,17 @@ def recolectar(sigo_vivo=lambda: True):
     """
     while sigo_vivo():
         try:
-            respuesta = CLIENTE.tomar_respuesta(IDENTIDAD, ESPERA_RECOLECTOR)
+            codigo, respuesta = CLIENTE.tomar_respuesta(IDENTIDAD, ESPERA_RECOLECTOR)
         except ErrorCola as e:
             # La cola no responde. No se reintenta en bucle cerrado: sería
             # golpear un servicio caído miles de veces por segundo.
             print(f"[recolector] la cola no responde: {e}", flush=True)
             time.sleep(ESPERA_REINTENTO)
             continue
-        if not respuesta:
+        if codigo in (503, 421):
+            time.sleep(ESPERA_REINTENTO)
+            continue
+        if codigo == 204 or not respuesta:
             continue
         id = respuesta.get("id")
         with _LOCK_ESPERAS:
@@ -414,11 +418,15 @@ def derivar(operacion, parametros=None, idempotente=True, cliente=None):
             # diseño agrega y que hay que nombrar en el informe.
             return 503, {"error": "el sistema de colas no responde"}, None, f"cola caída: {e} {req}"
         if codigo == 503:
+            err_msg = datos.get("error") if isinstance(datos, dict) else None
+            if err_msg == "el sistema de colas no responde":
+                return 503, {"error": "el sistema de colas no responde"}, None, f"cola sin líder: {req}"
             return (503, {"error": "cola llena"}, None,
-                    f"cola llena ({datos.get('esperando')}/{datos.get('cota')}) {req}")
+                    f"cola llena ({datos.get('esperando') if isinstance(datos, dict) else '?'}/{datos.get('cota') if isinstance(datos, dict) else '?'}) {req}")
         if codigo != 202:
+            err_str = datos.get('error', '') if isinstance(datos, dict) else ''
             return (502, {"error": "la cola rechazó el pedido"}, None,
-                    f"HTTP {codigo} {datos.get('error', '')} {req}")
+                    f"HTTP {codigo} {err_str} {req}")
 
         if not espera.listo.wait(timeout=PRESUPUESTO + GRACIA):
             # La cola tendría que haber devuelto un DEADLINE_EXCEEDED al vencer
@@ -571,6 +579,23 @@ class Manejador(BaseHTTPRequestHandler):
         # 503 mientras el servicio devuelve 200 sería peor que no tener /health.
         consumiendo = sum(1 for c in (cola or {}).get("consumidores", {}).values()
                           if consume(c.get("ultimoPedidoHaceMs")))
+        
+        instancias = CLIENTE.instancias()
+        master_url = CLIENTE.master_conocido()
+        master_inst = next((i for i in instancias if i["url"] == master_url), None) if master_url else None
+
+        if not instancias or all(i.get("rol") == "caido" for i in instancias):
+            estado_cola = "caída"
+        elif master_inst and master_inst.get("rol") == "master":
+            estado_cola = "sana" if cola is not None else "eligiendo"
+        elif any(i.get("rol") == "master" for i in instancias):
+            estado_cola = "sana" if cola is not None else "eligiendo"
+        else:
+            estado_cola = "eligiendo"
+
+        rol_master = master_inst.get("rol") if master_inst else ("master" if cola is not None else None)
+        termino_master = master_inst.get("termino", 0) if master_inst else 0
+
         codigo = 200 if (cola is not None and consumiendo) else 503
         if cola is None:
             estado = "sin cola"
@@ -589,7 +614,10 @@ class Manejador(BaseHTTPRequestHandler):
             "replicasTotales": len(backends),
             "cola": {
                 "url": CLIENTE.url,
-                "estado": "sana" if cola is not None else "sin respuesta",
+                "rol": rol_master,
+                "termino": termino_master,
+                "estado": estado_cola,
+                "instancias": instancias,
                 "encolados": pedidos.get("esperando"),
                 "enVuelo": pedidos.get("enVuelo"),
                 "cota": pedidos.get("cota"),

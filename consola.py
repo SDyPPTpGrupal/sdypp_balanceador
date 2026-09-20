@@ -97,7 +97,7 @@ DEFAULTS = {
     "BA_ADMIN_BIND": "127.0.0.1",
     "BA_ADMIN_IPS": "",
     "BA_BACKENDS": "",
-    "BA_COLA_URL": "http://127.0.0.1:8085",
+    "BA_COLA_URL": "http://127.0.0.1:8085,http://127.0.0.1:8086,http://127.0.0.1:8087",
     "BA_COLA_TOKEN": "",
     "BA_RECOLECTORES": "4",
     "BA_ESPERA_RECOLECTOR": "20",
@@ -634,11 +634,19 @@ def configurar(cfg=None):
     print()
     print(pintar("La cola", "1"))
     nota("Corre en su propio contenedor. El balanceador no atiende nada sin ella.")
-    cfg["COLA_PUERTO"] = pedir("Puerto de la cola",
+    cfg["COLA_PUERTO"] = pedir("Puerto base de la cola",
                                "Por acá entran los workers de las réplicas.",
                                default=cfg.get("COLA_PUERTO") or "8085", validar=es_puerto)
     cfg["COLA_CASA"] = cfg["BA_CASA"]
-    cfg["BA_COLA_URL"] = f"http://127.0.0.1:{cfg['COLA_PUERTO']}"
+    nodos = int(pedir("Cantidad de nodos del clúster de colas",
+                      "Mínimo 3 nodos recomendados para alta disponibilidad (impar).",
+                      default=cfg.get("COLA_NODOS") or "3", validar=es_numero))
+    if nodos < 1:
+        nodos = 1
+    cfg["COLA_NODOS"] = str(nodos)
+    puerto_base = int(cfg["COLA_PUERTO"])
+    urls_semilla = [f"http://127.0.0.1:{puerto_base + i}" for i in range(nodos)]
+    cfg["BA_COLA_URL"] = ",".join(urls_semilla)
 
     # El token se genera en vez de pedirse: uno elegido a mano termina siendo
     # "cola123" y esto lo alcanza cualquiera del tailnet.

@@ -73,6 +73,14 @@ class ClienteReplica:
         with self._lock:
             return self._master
 
+    @property
+    def url(self):
+        """Retorna el master actualmente conocido, o la lista de semillas."""
+        with self._lock:
+            if self._master:
+                return self._master
+        return ",".join(self._urls)
+
     def _descubrir_master(self, presupuesto_restante):
         """Sondea la lista de semillas vía GET /health hasta encontrar un master."""
         t0 = time.monotonic()
