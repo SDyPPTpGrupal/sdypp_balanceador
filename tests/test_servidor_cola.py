@@ -100,7 +100,8 @@ class PruebasCicloCompleto(ConServidor):
             "atendidoPor": REPLICA, "app": "python"})
         self.assertEqual(codigo, 202)
 
-        respuesta = self.cliente.tomar_respuesta(BALANCEADOR, 1)
+        codigo_resp, respuesta = self.cliente.tomar_respuesta(BALANCEADOR, 1)
+        self.assertEqual(codigo_resp, 200)
         self.assertEqual(respuesta["estado"], "OK")
         self.assertEqual(respuesta["contenido"], {"personas": []})
         self.assertEqual(respuesta["atendidoPor"], REPLICA)
@@ -273,10 +274,10 @@ class PruebasCliente(ConServidor):
         moriría con `BadStatusLine` sobre esa misma conexión reusada, y el
         síntoma aparecería recién cuando llega tráfico real.
         """
-        self.assertIsNone(self.cliente.tomar_respuesta(BALANCEADOR, 0))   # 204
+        self.assertEqual(self.cliente.tomar_respuesta(BALANCEADOR, 0)[0], 204)   # 204
         self.assertEqual(len(self.cliente._libres), 1)                    # la guardó
         self.assertEqual(self.publicar()[0], 202)                         # y sirve
-        self.assertIsNone(self.cliente.tomar_respuesta(BALANCEADOR, 0))
+        self.assertEqual(self.cliente.tomar_respuesta(BALANCEADOR, 0)[0], 204)
         self.assertEqual(self.worker("/pedidos/tomar", {"consumidor": REPLICA, "espera": 0})[0],
                          200)
 
@@ -284,12 +285,14 @@ class PruebasCliente(ConServidor):
         """Lo que hace el recolector todo el día: long-polls vacíos intercalados
         con respuestas de verdad, siempre sobre la misma conexión."""
         for i in range(3):
-            self.assertIsNone(self.cliente.tomar_respuesta(BALANCEADOR, 0))
+            self.assertEqual(self.cliente.tomar_respuesta(BALANCEADOR, 0)[0], 204)
             self.publicar(id=f"p{i}")
             self.worker("/pedidos/tomar", {"consumidor": REPLICA, "espera": 0})
             self.worker("/respuestas", {"id": f"p{i}", "estado": "OK", "contenido": {},
                                         "atendidoPor": REPLICA})
-            self.assertEqual(self.cliente.tomar_respuesta(BALANCEADOR, 1)["id"], f"p{i}")
+            codigo_resp, resp = self.cliente.tomar_respuesta(BALANCEADOR, 1)
+            self.assertEqual(codigo_resp, 200)
+            self.assertEqual(resp["id"], f"p{i}")
 
     def test_la_cola_caida_es_un_error_distinto_de_la_cola_llena(self):
         """"No hay nadie" y "no entra" se atienden distinto: una es 503 por
