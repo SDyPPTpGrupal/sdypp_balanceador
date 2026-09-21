@@ -1,4 +1,0 @@
-# Sólo para generar los stubs desde contrato.proto. No hace falta en ejecución.
-#
-#   python -m grpc_tools.protoc -I. --python_out=app --grpc_python_out=app contrato.proto
-grpcio-tools==1.83.1
