@@ -231,11 +231,36 @@ pueden estar cruzados y los dos casos son reales:
 | Registrada y sana, no consume | el contenedor vive y su worker no arrancó | `503` si es la única |
 | Cola caída | nadie atiende nada | `503` siempre |
 
-`replicasSanas` sigue saliendo, pero como información y no como veredicto: es lo que el CD
-mira después de un deploy. El campo nuevo es `replicasConsumiendo`, y es el que decide.
+Lleva sólo lo que necesita un cliente, y nada dos veces:
 
-La consola lo muestra como dos columnas separadas (`sano` y `consume`) justamente para que se
-vea cuándo no coinciden.
+```jsonc
+{"Code": 200, "contenido": {
+  "balanceador": "sano",                        // o "sin cola" / "sin réplicas consumiendo"
+  "casa": "casa-tomas",
+  "replicas": ["casa-a:8080", "casa-b:8080"],   // las que pidieron trabajo a la cola hace poco
+  "cola": {
+    "estado": "sana",                           // o "eligiendo" / "caída"
+    "encolados": 0, "enVuelo": 0, "cota": 100,
+    "nodos": [
+      {"url": "http://100.120.186.92:8085", "instancia": "cola-juan", "rol": "master", "termino": 124},
+      {"url": "http://100.91.134.43:8085", "instancia": "cola-salva", "rol": "slave", "termino": 124},
+      {"url": "http://100.78.246.64:8085", "rol": "caido"}      // sin nombre ni término: no contestó
+    ]}}}
+```
+
+**Cómo sabe qué réplicas andan.** El worker de cada réplica le pide trabajo a la cola
+(`POST /pedidos/tomar`) con su `host:puerto` como `consumidor`, y la cola anota cuándo lo
+vio por última vez. El balanceador lee eso de `GET /estado` de la cola y lista las que
+pidieron en los últimos `BA_UMBRAL_CONSUMO` segundos (45). El umbral tiene que ser mayor
+que el long-poll más largo de los workers (hasta 30 s): una réplica sana que espera trabajo
+no pide de nuevo hasta que se le vence la espera. La contracara es que **una réplica muerta
+sigue en la lista hasta que pasa el umbral**: la cola sabe cuándo pidió por última vez, no
+que se murió.
+
+**El registro del CD no sale en `/health`.** Qué réplicas conmutó el CD y si pasan el health
+gRPC (`sano`, `fallos`, `atendidos`) está en `GET /admin/backends`, en el puerto de control,
+que es donde lo lee el CD. La consola lo muestra en el menú 1, con las columnas `sano` y
+`consume` separadas justamente para que se vea cuándo no coinciden.
 
 ## Los dos planos
 
@@ -286,8 +311,8 @@ es exactamente el tipo de decisión que hay que poder defender en vivo.
 
 1. **Un salto de red más por pedido**, y un componente nuevo en el camino crítico.
 2. **Un punto único de falla nuevo:** sin cola no se atiende nada, aunque las cuatro réplicas
-   estén perfectas. Por eso `/health` contesta `503` con la cola caída aunque `replicasSanas`
-   sea 4 — mentir ahí sería peor.
+   estén perfectas. Por eso `/health` contesta `503` con la cola caída aunque las cuatro
+   pasen el health gRPC — mentir ahí sería peor.
 3. **La reasignación pasó a depender de un vencimiento**, no de un error. Antes el
    `UNAVAILABLE` del RPC era instantáneo; ahora hay que esperar `COLA_RESERVA` (2 s) para
    notar que una réplica se murió con el pedido en la mano. El presupuesto de 5 s deja lugar

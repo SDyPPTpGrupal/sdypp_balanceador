@@ -52,15 +52,17 @@ class TestBalanceadorCutover(unittest.TestCase):
     @patch.object(balanceador.CLIENTE, "instancias")
     @patch.object(balanceador.CLIENTE, "master_conocido")
     def test_salud_campos_aditivos_cluster(self, mock_master, mock_instancias, mock_estado):
-        """salud() agrega rol, termino, estado e instancias en la sección cola."""
+        """salud() dice quién consume y cómo está cada nodo, sin repetir nada."""
         mock_master.return_value = "http://127.0.0.1:8085"
         mock_instancias.return_value = [
             {"url": "http://127.0.0.1:8085", "instancia": "cola-8085", "rol": "master", "termino": 2},
             {"url": "http://127.0.0.1:8086", "instancia": "cola-8086", "rol": "slave", "termino": 2},
+            {"url": "http://127.0.0.1:8087", "instancia": "", "rol": "caido", "termino": 0},
         ]
         mock_estado.return_value = {
             "pedidos": {"esperando": 0, "enVuelo": 0, "cota": 100},
-            "consumidores": {"10.0.0.1:8080": {"ultimoPedidoHaceMs": 1000}},
+            "consumidores": {"10.0.0.1:8080": {"ultimoPedidoHaceMs": 1000},
+                             "10.0.0.2:8080": {"ultimoPedidoHaceMs": 999_000}},
             "respuestas": {"pendientes": 0},
         }
 
@@ -75,12 +77,20 @@ class TestBalanceadorCutover(unittest.TestCase):
         balanceador.ManejadorPublico.salud(handler)
 
         cuerpo = handler.resp_cuerpo
-        self.assertIn("cola", cuerpo)
+        self.assertEqual(handler.resp_codigo, 200)
+        # Sólo la que pidió trabajo hace poco: la de hace 999 s ya no cuenta.
+        self.assertEqual(cuerpo["replicas"], ["10.0.0.1:8080"])
         cola_info = cuerpo["cola"]
-        self.assertEqual(cola_info.get("rol"), "master")
-        self.assertEqual(cola_info.get("termino"), 2)
         self.assertEqual(cola_info.get("estado"), "sana")
-        self.assertEqual(len(cola_info.get("instancias")), 2)
+        self.assertEqual(cola_info.get("cota"), 100)
+        nodos = cola_info.get("nodos")
+        self.assertEqual([n["rol"] for n in nodos], ["master", "slave", "caido"])
+        self.assertEqual(nodos[0]["termino"], 2)
+        # De un nodo caído no se inventan nombre ni término.
+        self.assertEqual(nodos[2], {"url": "http://127.0.0.1:8087", "rol": "caido"})
+        # Nada repetido ni del registro del CD en lo que ve el cliente.
+        self.assertEqual(set(cuerpo), {"balanceador", "casa", "replicas", "cola"})
+        self.assertEqual(set(cola_info), {"estado", "encolados", "enVuelo", "cota", "nodos"})
 
 
 if __name__ == "__main__":

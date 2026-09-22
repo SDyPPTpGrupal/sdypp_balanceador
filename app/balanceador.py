@@ -485,6 +485,18 @@ def backends_json():
     return salida, cola
 
 
+def nodo_json(instancia):
+    """Un nodo de la cola, como sale en /health.
+
+    De un nodo que no contestó no se sabe ni el nombre ni el término: se dice
+    que no contestó y nada más, en vez de mostrar un término 0 que parece un
+    dato.
+    """
+    if instancia.get("rol") in ("caido", "desconocido"):
+        return {"url": instancia["url"], "rol": instancia["rol"]}
+    return instancia
+
+
 # --- El servidor HTTP ------------------------------------------------------
 
 class Manejador(BaseHTTPRequestHandler):
@@ -564,71 +576,55 @@ class Manejador(BaseHTTPRequestHandler):
         aunque las cuatro réplicas estén perfectas, y una réplica registrada y
         sana cuyo worker no arrancó tampoco atiende nada.
 
-        `replicasSanas` sigue saliendo, pero como información y no como
-        veredicto: es lo que el CD mira después de un deploy.
+        Es lo que ve un cliente, así que lleva sólo eso y nada dos veces. El
+        registro del CD (qué réplicas se conmutaron y si pasan el health gRPC)
+        no sale acá: no decide si se atiende, y vive en `/admin/backends`, que
+        es donde lo lee el CD.
         """
-        backends, cola = backends_json()
-        sanos = sum(1 for b in backends if b["sano"])
+        cola = CLIENTE.estado()
         pedidos = (cola or {}).get("pedidos", {})
 
         # Quién atiende de verdad se cuenta desde la cola y no desde el registro,
-        # y es el número que decide el código HTTP. Con los workers afuera, una
-        # réplica atiende porque consume, no porque esté anotada acá ni porque
-        # conteste el health gRPC: puede estar consumiendo sin que el CD la haya
+        # y es lo que decide el código HTTP. Con los workers afuera, una réplica
+        # atiende porque consume, no porque esté anotada acá ni porque conteste
+        # el health gRPC: puede estar consumiendo sin que el CD la haya
         # registrado todavía, o registrada y sana con el worker muerto. Contestar
         # 503 mientras el servicio devuelve 200 sería peor que no tener /health.
-        consumiendo = sum(1 for c in (cola or {}).get("consumidores", {}).values()
-                          if consume(c.get("ultimoPedidoHaceMs")))
-        
-        instancias = CLIENTE.instancias()
-        master_url = CLIENTE.master_conocido()
-        master_inst = next((i for i in instancias if i["url"] == master_url), None) if master_url else None
+        #
+        # Una réplica que se muere sigue en la lista hasta UMBRAL_CONSUMO: la
+        # cola sólo sabe cuándo pidió trabajo por última vez, no que se murió.
+        replicas = sorted(c for c, d in (cola or {}).get("consumidores", {}).items()
+                          if consume(d.get("ultimoPedidoHaceMs")))
 
+        instancias = CLIENTE.instancias()
         if not instancias or all(i.get("rol") == "caido" for i in instancias):
             estado_cola = "caída"
-        elif master_inst and master_inst.get("rol") == "master":
-            estado_cola = "sana" if cola is not None else "eligiendo"
-        elif any(i.get("rol") == "master" for i in instancias):
-            estado_cola = "sana" if cola is not None else "eligiendo"
+        elif cola is not None and any(i.get("rol") == "master" for i in instancias):
+            estado_cola = "sana"
         else:
             estado_cola = "eligiendo"
 
-        rol_master = master_inst.get("rol") if master_inst else ("master" if cola is not None else None)
-        termino_master = master_inst.get("termino", 0) if master_inst else 0
-
-        codigo = 200 if (cola is not None and consumiendo) else 503
+        codigo = 200 if (cola is not None and replicas) else 503
         if cola is None:
             estado = "sin cola"
-        elif not consumiendo:
+        elif not replicas:
             estado = "sin réplicas consumiendo"
         else:
             estado = "sano"
         bitacora("GET /health", codigo, None,
-                 f"consumiendo={consumiendo} sanos={sanos}/{len(backends)} "
-                 f"cola={'sí' if cola else 'NO'} encolados={pedidos.get('esperando', '?')}")
+                 f"replicas={len(replicas)} cola={estado_cola} "
+                 f"encolados={pedidos.get('esperando', '?')}")
         self.responder(codigo, {
             "balanceador": estado,
             "casa": CASA,
-            "replicasConsumiendo": consumiendo,
-            "replicasSanas": sanos,
-            "replicasTotales": len(backends),
+            "replicas": replicas,
             "cola": {
-                "url": CLIENTE.url,
-                "rol": rol_master,
-                "termino": termino_master,
                 "estado": estado_cola,
-                "instancias": instancias,
                 "encolados": pedidos.get("esperando"),
                 "enVuelo": pedidos.get("enVuelo"),
                 "cota": pedidos.get("cota"),
-                "reasignados": pedidos.get("reasignados"),
-                "respuestasPendientes": (cola or {}).get("respuestas", {}).get("pendientes"),
+                "nodos": [nodo_json(i) for i in instancias],
             },
-            # Se repiten arriba por compatibilidad: el verificador y la consola
-            # del CD ya leían `encolados` y `cota` al ras del contenido.
-            "encolados": pedidos.get("esperando"),
-            "cota": pedidos.get("cota"),
-            "backends": backends,
         })
 
     def echo(self):

@@ -284,9 +284,9 @@ def encabezado(cfg):
     if datos:
         color = "32" if codigo == 200 else "33"
         cola = datos.get("cola") or {}
-        estado = pintar(f"{datos.get('replicasSanas', 0)}/{datos.get('replicasTotales', 0)} sanas"
+        estado = pintar(f"{len(datos.get('replicas') or [])} consumiendo"
                         f" · cola {cola.get('estado', '?')}"
-                        f" · {datos.get('encolados', 0)}/{datos.get('cota', '?')} en cola"
+                        f" · {cola.get('encolados', 0)}/{cola.get('cota', '?')} en cola"
                         f" · {cola.get('enVuelo', 0)} en vuelo", color)
     elif corriendo():
         estado = pintar("arrancando o sin responder", "33")
@@ -377,7 +377,7 @@ def levantar(cfg):
         if backends(cfg) is not None:
             ok(f"arriba · público :{cfg['BA_PUERTO']} · control {cfg['BA_ADMIN_BIND']}:{cfg['BA_PUERTO_ADMIN']}")
             if not cfg["BA_BACKENDS"]:
-                nota("el registro arranca vacío: /health contesta 503 hasta el primer deploy del CD")
+                nota("el registro arranca vacío hasta el primer deploy del CD")
             nota("las réplicas atienden cuando su worker consume de la cola, no cuando "
                  "entran acá")
             return True
@@ -396,7 +396,8 @@ def ver_pool(cfg):
         nota("escucha en loopback: esta consola tiene que correr en la misma máquina")
         return
     if not datos["backends"]:
-        aviso("vacío. /health contesta 503 hasta que el CD conmute por primera vez.")
+        aviso("vacío hasta que el CD conmute por primera vez. Quién atiende lo dice "
+              "la cola: menú 2.")
         return
     print(pintar(f"\n    {'destino':<24}{'app':<9}{'sano':<7}{'consume':<10}{'vuelo':<7}"
                  f"{'fallos':<8}atendidos", "90"))
@@ -419,18 +420,22 @@ def ver_health(cfg):
         mal(f"no responde en {url_publica(cfg)}")
         return
     print(f"\n  HTTP {codigo}"
-          + ("" if codigo == 200 else pintar("  (503 = sin cola o sin réplicas sanas)", "33")))
-    for clave in ("balanceador", "casa", "replicasSanas", "replicasTotales"):
+          + ("" if codigo == 200 else pintar("  (503 = sin cola o sin réplicas consumiendo)", "33")))
+    for clave in ("balanceador", "casa"):
         if clave in datos:
             print(f"    {clave:<16} {datos[clave]}")
+    replicas = datos.get("replicas") or []
+    print(f"    {'replicas':<16} {', '.join(replicas) or '(ninguna consumiendo)'}")
     cola = datos.get("cola") or {}
     print(pintar("\n  la cola", "1"))
-    for clave in ("url", "estado", "encolados", "enVuelo", "cota", "reasignados",
-                  "respuestasPendientes"):
+    for clave in ("estado", "encolados", "enVuelo", "cota"):
         print(f"    {clave:<22} {cola.get(clave, '—')}")
+    for nodo in cola.get("nodos") or []:
+        termino = f" · término {nodo['termino']}" if "termino" in nodo else ""
+        print(f"    {nodo.get('instancia') or nodo.get('url', '?'):<22} {nodo.get('rol', '?')}{termino}")
     print()
-    nota("reasignados = pedidos que una réplica tomó y no contestó, y otra terminó "
-         "atendiendo")
+    nota("replicas = las que fueron a buscar trabajo a la cola hace poco; el registro "
+         "del CD está en el menú 1")
     nota(f'el cuerpo viaja envuelto: {{"Code": {codigo}, "contenido": {{…}}}}')
     nota("misma forma para el éxito y para el error; lo de arriba es el contenido")
 

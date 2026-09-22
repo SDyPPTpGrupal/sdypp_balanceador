@@ -200,9 +200,11 @@ class TestStrictIntegration(unittest.TestCase):
                 h = FakeHandler()
                 balanceador.ManejadorPublico.salud(h)
                 self.assertEqual(h.data["cola"]["estado"], "sana")
-                self.assertEqual(h.data["cola"]["rol"], "master")
-                self.assertEqual(h.data["cola"]["termino"], 5)
-                self.assertEqual(len(h.data["cola"]["instancias"]), 3)
+                nodos = h.data["cola"]["nodos"]
+                self.assertEqual(len(nodos), 3)
+                masters = [n for n in nodos if n["rol"] == "master"]
+                self.assertEqual(len(masters), 1)
+                self.assertEqual(masters[0]["termino"], 5)
 
                 # Estado 2: Clúster Eligiendo (sin master)
                 self.nodes[0]["rol"] = "slave"
