@@ -916,6 +916,25 @@ class ManejadorAdmin(Manejador):
         self.responder(404, {"error": "no existe"})
 
 
+class Servidor(ThreadingHTTPServer):
+    """Igual que el de la biblioteca, pero sin traceback por conexión cortada.
+
+    Un cliente que se cansa de esperar y corta —un curl con `--max-time`, la
+    consola, un worker que se apaga durante el long-poll— deja siempre un
+    `BrokenPipeError` al escribir la respuesta. Es el caso normal, no un error:
+    con el traceback puesto, la salida del contenedor se llena de fallas que no
+    lo son y la bitácora de verdad deja de leerse.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, direccion):
+        tipo = sys.exc_info()[0]
+        if tipo is not None and issubclass(tipo, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, direccion)
+
+
 def main():
     # "host:puerto" o "host:puerto=java". Sin la etiqueta se asume python. Hace
     # falta poder decirlo porque tras un reinicio el registro se rearma desde
@@ -937,12 +956,10 @@ def main():
     for b in POOL.todos():
         b.chequear()
 
-    admin = ThreadingHTTPServer((ADMIN_BIND, PUERTO_ADMIN), ManejadorAdmin)
-    admin.daemon_threads = True
+    admin = Servidor((ADMIN_BIND, PUERTO_ADMIN), ManejadorAdmin)
     threading.Thread(target=admin.serve_forever, daemon=True).start()
 
-    servidor = ThreadingHTTPServer(("0.0.0.0", PUERTO), ManejadorPublico)
-    servidor.daemon_threads = True
+    servidor = Servidor(("0.0.0.0", PUERTO), ManejadorPublico)
     bitacora("arranque", "OK", None,
              f"publico=0.0.0.0:{PUERTO} admin={ADMIN_BIND}:{PUERTO_ADMIN} "
              f"cola={CLIENTE.url} identidad={IDENTIDAD} recolectores={RECOLECTORES} "
