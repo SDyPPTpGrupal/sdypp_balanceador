@@ -168,13 +168,3 @@ cualquier otro dato, así que sobrevive a un cambio de líder y a un reinicio de
 | `502` | La cola rechazó el pedido |
 | `503` | No hay quién atienda: cola caída, cola llena, ninguna réplica consumiendo, o la réplica se quedó sin su base |
 | `504` | Ninguna réplica lo atendió dentro del presupuesto (5 s, o 60 s con ticket) |
-
-## Límites, para no perder tiempo
-
-- **Corre en una notebook.** Está arriba durante la demo y las pruebas; fuera de eso puede estar
-  apagada y no responder nada.
-- **Un `503` con `cola.estado` en `caída`** es que las PCs que corren el clúster no están prendidas,
-  no un problema de quien consulta.
-- **El plano de control no es público.** `/admin/backends` lo atiende otro puerto, que sólo se
-  alcanza desde la propia máquina.
-- **No hay borrado ni modificación**: las cinco operaciones de arriba son todo el servicio.
