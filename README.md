@@ -118,6 +118,40 @@ protobuf a JSON campo por campo; ahora el worker manda el `contenido` ya armado 
 balanceador sólo lo mete en el sobre. Agregar un campo a la app dejó de obligar a tocar acá.
 La forma de cada `contenido` está en [`cola/README.md`](cola/README.md#las-operaciones).
 
+### Sin quedarse esperando: `Prefer: respond-async`
+
+Por defecto el cliente espera su respuesta en la misma conexión, hasta `BA_PRESUPUESTO`. Si
+manda `Prefer: respond-async` (RFC 7240) en `GET /`, `POST /echo`, `GET /personas` o
+`POST /personas`, recibe en el acto un ticket y la retira después:
+
+```
+POST /personas   Prefer: respond-async
+← 202  Location: /pedidos/4b7b….1790058626   Retry-After: 1   Preference-Applied: respond-async
+   {"Code": 202, "contenido": {"id": "4b7b….1790058626", "estado": "pendiente"}}
+
+GET /pedidos/4b7b….1790058626
+← 202 {"estado": "pendiente"}               todavía en la cola: volver en Retry-After
+← 201 / 200 / 409 / 400 / 504 …             lo mismo que habría contestado sincrónico
+← 404                                       ticket mal formado o vencido
+```
+
+**El balanceador no guarda nada.** Cada pedido asincrónico se publica con su propio
+destinatario, `ticket:<id>`, así que la respuesta queda en la cola en una caja propia —la cola
+entrega por destinatario, no por id de pedido— y los recolectores no la ven. `GET /pedidos`
+la retira de esa caja. Consecuencias:
+
+- la respuesta está **replicada por Raft**: sobrevive a un cambio de master y a un reinicio
+  del balanceador, y la puede retirar cualquier balanceador;
+- sin nadie con una conexión abierta, el pedido puede esperar `BA_PRESUPUESTO_ASYNC` (60 s)
+  en vez de 5: lo que dure una caída de los workers;
+- **se entrega una sola vez**: retirarla la saca de la cola. Una segunda consulta dice
+  `pendiente` hasta que el ticket vence;
+- una caja vacía no distingue «todavía no» de «ya se retiró» o «la cola la descartó». Lo
+  único que se sabe sin guardar nada es la hora que lleva el ticket: pasados
+  `BA_PRESUPUESTO_ASYNC + BA_TTL_TICKET` ya no puede haber nada y es `404` sin preguntar.
+
+El uuid del ticket es imposible de adivinar: es la llave para leer la respuesta.
+
 ## Levantarlo
 
 **Son dos contenedores y la cola va primero.** Al revés, el balanceador arranca contestando
@@ -326,8 +360,10 @@ es exactamente el tipo de decisión que hay que poder defender en vivo.
    destinatario y ninguno se lleva las del otro—, pero **la decisión de si van dos colas o una
    está abierta.**
 
-**Lo que no cambió:** el contrato con el cliente es sincrónico. El cliente hace
-`POST /personas` y espera su `201` en el mismo socket. Nada de tickets, `202` ni polling.
+**Lo que no cambió:** por defecto el contrato con el cliente es sincrónico. El cliente hace
+`POST /personas` y espera su `201` en el mismo socket. Los tickets existen, pero sólo para el
+que los pide con `Prefer: respond-async`: el verificador y los clientes que ya existían no
+notan nada.
 
 ## Reglas
 
@@ -447,6 +483,8 @@ Del balanceador:
 | `BA_ESPERA_RECOLECTOR` | `20` | Segundos de cada long-poll |
 | `BA_PRESUPUESTO` | `5` | Presupuesto total por pedido, espera en cola incluida |
 | `BA_GRACIA_COLA` | `1` | Margen sobre el presupuesto antes de rendirse solo |
+| `BA_PRESUPUESTO_ASYNC` | `60` | Presupuesto de un pedido con ticket. La cola lo topa en `COLA_PRESUPUESTO_MAXIMO` |
+| `BA_TTL_TICKET` | `60` | Tiene que ser el `COLA_TTL_RESPUESTAS` de los nodos: con eso se sabe cuándo un ticket venció |
 | `BA_BACKENDS` | *(vacío)* | Réplicas iniciales. `host:puerto` o `host:puerto=java` |
 | `BA_UMBRAL_CONSUMO` | `45` | Hace cuánto tiene que haber pedido trabajo una réplica para contarla como consumiendo. Mayor que el long-poll de los workers |
 | `BA_INTERVALO_SALUD` | `3` | Segundos entre chequeos de salud |

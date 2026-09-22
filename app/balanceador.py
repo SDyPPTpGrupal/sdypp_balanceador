@@ -20,8 +20,12 @@ Qué queda del balanceador después de sacarle los workers:
   * el pool de réplicas y el vigilante de salud, que ya **no rutean** nada: son
     lo que /health y el CD miran para saber qué réplicas hay y si están vivas.
 
-El contrato con el cliente no cambió: **toda** respuesta del plano público sale
-con la misma forma, salga bien o mal.
+Por defecto el cliente espera su respuesta en la misma conexión. Con
+`Prefer: respond-async` (RFC 7240) recibe en el acto un `202` con un ticket y la
+retira después con `GET /pedidos/<ticket>`: la respuesta la guarda la cola,
+replicada, no el balanceador.
+
+**Toda** respuesta del plano público sale con la misma forma, salga bien o mal.
 
     {"Code": 200, "contenido": {"app": "python", "version": 3, ...}}
     {"Code": 404, "contenido": {"error": "no existe"}}
@@ -42,6 +46,7 @@ el pedido. El precio es que el balanceador conoce el contrato.
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -103,6 +108,18 @@ PRESUPUESTO = float(os.environ.get("BA_PRESUPUESTO", os.environ.get("BA_TIMEOUT_
 # margen es la red de contención para el caso en que la cola *misma* no
 # conteste. Si salta este timeout y no el de la cola, el problema es la cola.
 GRACIA = float(os.environ.get("BA_GRACIA_COLA", "1"))
+
+# Los pedidos asincrónicos no tienen a nadie con una conexión abierta, así que
+# pueden esperar en la cola mucho más: lo que dure una caída de los workers, con
+# el techo que pone la cola (COLA_PRESUPUESTO_MAXIMO, 60 s).
+PRESUPUESTO_ASYNC = float(os.environ.get("BA_PRESUPUESTO_ASYNC", "60"))
+# Cuánto guarda la cola una respuesta que nadie retiró. Tiene que ser el
+# COLA_TTL_RESPUESTAS de los nodos: es lo que fija cuándo un ticket ya no puede
+# tener nada adentro y se contesta 404 sin preguntar.
+TTL_TICKET = float(os.environ.get("BA_TTL_TICKET", "60"))
+# uuid4 en hex, punto, el segundo en que se emitió. El uuid es imposible de
+# adivinar y hace de llave; la hora deja saber sin guardar nada si ya venció.
+FORMA_TICKET = re.compile(r"[0-9a-f]{32}\.(\d{1,12})")
 
 # Hilos que recolectan respuestas. Cada uno tiene un long-poll abierto contra la
 # cola; con uno solo, todas las respuestas del servicio pasarían por un único
@@ -387,6 +404,46 @@ def _camino(respuesta):
     return f"intentos={'→'.join(intentos)} " if len(intentos) > 1 else ""
 
 
+def _publicar(pedido):
+    """Publica en la cola. None si quedó encolado; si no, (codigo, contenido, detalle).
+
+    Es el mismo tratamiento de error para el camino sincrónico y el de tickets:
+    una cola caída o llena se le dice al cliente igual en los dos.
+    """
+    req = f"req={pedido['id']}"
+    try:
+        codigo, datos = CLIENTE.publicar_pedido(pedido)
+    except ErrorCola as e:
+        # Sin cola no hay servicio: es el punto único de falla que este
+        # diseño agrega y que hay que nombrar en el informe.
+        return 503, {"error": "el sistema de colas no responde"}, f"cola caída: {e} {req}"
+    if codigo == 503:
+        err_msg = datos.get("error") if isinstance(datos, dict) else None
+        if err_msg == "el sistema de colas no responde":
+            return 503, {"error": "el sistema de colas no responde"}, f"cola sin líder: {req}"
+        return (503, {"error": "cola llena"},
+                f"cola llena ({datos.get('esperando') if isinstance(datos, dict) else '?'}/{datos.get('cota') if isinstance(datos, dict) else '?'}) {req}")
+    if codigo != 202:
+        err_str = datos.get('error', '') if isinstance(datos, dict) else ''
+        return 502, {"error": "la cola rechazó el pedido"}, f"HTTP {codigo} {err_str} {req}"
+    return None
+
+
+def _traducir(r, detalle):
+    """La respuesta de un worker → (codigo_http, contenido, atendido_por, detalle).
+
+    `codigo_http` es None si salió bien: el éxito de cada ruta lo decide su
+    handler (un alta es 201, el resto 200).
+    """
+    estado = r.get("estado", "INTERNAL")
+    atendido = r.get("atendidoPor")
+    detalle = f"{_camino(r)}espera={r.get('esperaMs', '?')}ms {detalle}"
+    if estado == "OK":
+        return None, r.get("contenido") or {}, atendido, detalle
+    return (CODIGOS.get(estado, 500), r.get("contenido") or {"error": estado},
+            atendido, f"{estado} {detalle}")
+
+
 def derivar(operacion, parametros=None, idempotente=True, cliente=None):
     """Publica el pedido en la cola y espera su respuesta.
 
@@ -411,22 +468,10 @@ def derivar(operacion, parametros=None, idempotente=True, cliente=None):
             "cliente": cliente,
             "presupuestoMs": int(PRESUPUESTO * 1000),
         }
-        try:
-            codigo, datos = CLIENTE.publicar_pedido(pedido)
-        except ErrorCola as e:
-            # Sin cola no hay servicio: es el punto único de falla que este
-            # diseño agrega y que hay que nombrar en el informe.
-            return 503, {"error": "el sistema de colas no responde"}, None, f"cola caída: {e} {req}"
-        if codigo == 503:
-            err_msg = datos.get("error") if isinstance(datos, dict) else None
-            if err_msg == "el sistema de colas no responde":
-                return 503, {"error": "el sistema de colas no responde"}, None, f"cola sin líder: {req}"
-            return (503, {"error": "cola llena"}, None,
-                    f"cola llena ({datos.get('esperando') if isinstance(datos, dict) else '?'}/{datos.get('cota') if isinstance(datos, dict) else '?'}) {req}")
-        if codigo != 202:
-            err_str = datos.get('error', '') if isinstance(datos, dict) else ''
-            return (502, {"error": "la cola rechazó el pedido"}, None,
-                    f"HTTP {codigo} {err_str} {req}")
+        error = _publicar(pedido)
+        if error:
+            codigo, contenido, detalle = error
+            return codigo, contenido, None, detalle
 
         if not espera.listo.wait(timeout=PRESUPUESTO + GRACIA):
             # La cola tendría que haber devuelto un DEADLINE_EXCEEDED al vencer
@@ -435,17 +480,82 @@ def derivar(operacion, parametros=None, idempotente=True, cliente=None):
             return (504, {"error": "sin respuesta a tiempo"}, None,
                     f"venció sin noticias de la cola {req}")
 
-        r = espera.respuesta
-        estado = r.get("estado", "INTERNAL")
-        atendido = r.get("atendidoPor")
-        detalle = f"{_camino(r)}espera={r.get('esperaMs', '?')}ms {req}"
-        if estado == "OK":
-            return None, r.get("contenido") or {}, atendido, detalle
-        return (CODIGOS.get(estado, 500), r.get("contenido") or {"error": estado},
-                atendido, f"{estado} {detalle}")
+        return _traducir(espera.respuesta, req)
     finally:
         with _LOCK_ESPERAS:
             ESPERAS.pop(id, None)
+
+
+# --- Los pedidos asincrónicos: un ticket en vez de una conexión abierta ------
+
+
+def destinatario_de(ticket):
+    """La caja de la cola donde queda la respuesta de ese ticket.
+
+    Un destinatario por ticket es lo que permite retirar *esa* respuesta: la
+    cola entrega por destinatario, no por id de pedido. Y como no es el
+    destinatario de los recolectores, ninguno se la lleva.
+    """
+    return f"ticket:{ticket}"
+
+
+def encolar(operacion, parametros=None, idempotente=True, cliente=None):
+    """Publica el pedido y vuelve en el acto: (codigo, contenido, detalle).
+
+    El balanceador no guarda nada. La respuesta queda en la cola, en la caja
+    del ticket, replicada como cualquier otra: sobrevive a un cambio de master
+    y a un reinicio del balanceador, y la puede retirar cualquier balanceador.
+    """
+    ticket = f"{uuid.uuid4().hex}.{int(time.time())}"
+    pedido = {
+        "id": ticket,
+        "operacion": operacion,
+        "parametros": parametros or {},
+        "idempotente": idempotente,
+        "destinatario": destinatario_de(ticket),
+        "cliente": cliente,
+        "presupuestoMs": int(PRESUPUESTO_ASYNC * 1000),
+    }
+    error = _publicar(pedido)
+    if error:
+        return error
+    return 202, {"id": ticket, "estado": "pendiente"}, f"ticket req={ticket}"
+
+
+def retirar(ticket):
+    """La respuesta de un ticket: (codigo_http, contenido, atendido_por, detalle).
+
+    202 mientras no haya nada en su caja. Retirarla la saca de la cola, así que
+    se entrega una sola vez: el cliente tiene que quedarse con lo que recibe.
+
+    Una caja vacía no distingue "todavía no" de "ya se retiró" o "la cola la
+    descartó por vieja". Lo único que se puede afirmar sin guardar nada es que,
+    pasado el presupuesto más el TTL de la cola, ya no puede haber nada: ahí es
+    404 sin preguntar.
+    """
+    forma = FORMA_TICKET.fullmatch(ticket)
+    if not forma:
+        return 404, {"error": "ticket desconocido o vencido"}, None, "ticket mal formado"
+    req = f"req={ticket}"
+    if time.time() > int(forma.group(1)) + PRESUPUESTO_ASYNC + TTL_TICKET:
+        return 404, {"error": "ticket desconocido o vencido"}, None, f"vencido {req}"
+
+    try:
+        codigo, r = CLIENTE.tomar_respuesta(destinatario_de(ticket), 0)
+    except ErrorCola as e:
+        return 503, {"error": "el sistema de colas no responde"}, None, f"cola caída: {e} {req}"
+    if codigo in (503, 421):
+        return 503, {"error": "el sistema de colas no responde"}, None, f"cola sin líder: {req}"
+    if codigo == 204 or not r:
+        return 202, {"id": ticket, "estado": "pendiente"}, None, f"pendiente {req}"
+    if codigo != 200:
+        return 502, {"error": "la cola rechazó el retiro"}, None, f"HTTP {codigo} {req}"
+
+    codigo, contenido, atendido, detalle = _traducir(r, req)
+    if codigo is None:
+        # El éxito de un alta es 201, igual que por el camino sincrónico.
+        codigo = 201 if r.get("operacion") == "POST /personas" else 200
+    return codigo, contenido, atendido, detalle
 
 
 def consume(hace_ms):
@@ -513,13 +623,15 @@ class Manejador(BaseHTTPRequestHandler):
 
     # -- utilidades --
 
-    def responder(self, codigo, cuerpo):
+    def responder(self, codigo, cuerpo, cabeceras=None):
         if self.sobre:
             cuerpo = {"Code": codigo, "contenido": cuerpo}
         crudo = json.dumps(cuerpo, ensure_ascii=False).encode()
         self.send_response(codigo)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(crudo)))
+        for nombre, valor in (cabeceras or {}).items():
+            self.send_header(nombre, valor)
         self.end_headers()
         self.wfile.write(crudo)
 
@@ -550,9 +662,33 @@ class Manejador(BaseHTTPRequestHandler):
             return ip in ADMIN_PERMITIDOS
         return ip in ("127.0.0.1", "::1")
 
-    def paso(self, operacion, codigo, respuesta, destino, detalle):
+    def paso(self, operacion, codigo, respuesta, destino, detalle, cabeceras=None):
         bitacora(operacion, codigo, destino, detalle)
-        self.responder(codigo, respuesta)
+        self.responder(codigo, respuesta, cabeceras)
+
+    def asincronico(self):
+        """¿El cliente pidió no quedarse esperando? `Prefer: respond-async` (RFC 7240).
+
+        Sin el header todo sigue siendo sincrónico: el verificador y cualquier
+        cliente que ya existía no notan la diferencia.
+        """
+        preferencias = (p.split(";")[0].split("=")[0].strip().lower()
+                        for p in self.headers.get("Prefer", "").split(","))
+        return "respond-async" in preferencias
+
+    def dar_ticket(self, operacion, parametros=None, idempotente=True):
+        codigo, contenido, detalle = encolar(operacion, parametros, idempotente,
+                                             cliente=self.client_address[0])
+        cabeceras = None
+        if codigo == 202:
+            cabeceras = {"Location": f"/pedidos/{contenido['id']}", "Retry-After": "1",
+                         "Preference-Applied": "respond-async"}
+        self.paso(operacion, codigo, contenido, None, detalle, cabeceras)
+
+    def ver_ticket(self, ticket):
+        codigo, contenido, destino, detalle = retirar(ticket)
+        cabeceras = {"Retry-After": "1"} if codigo == 202 else None
+        self.paso("GET /pedidos", codigo, contenido, destino, detalle, cabeceras)
 
     # -- el contrato público --
     #
@@ -561,6 +697,8 @@ class Manejador(BaseHTTPRequestHandler):
     # la decisión de quién atiende y qué se reintenta está en la cola.
 
     def identidad(self):
+        if self.asincronico():
+            return self.dar_ticket("GET /")
         codigo, contenido, destino, detalle = derivar("GET /", cliente=self.client_address[0])
         if codigo:
             return self.paso("GET /", codigo, contenido, destino, detalle)
@@ -631,11 +769,16 @@ class Manejador(BaseHTTPRequestHandler):
         cuerpo = self.cuerpo_json()
         if cuerpo is None:
             return self.paso("POST /echo", 400, {"error": "cuerpo no es JSON"}, None, None)
+        parametros = {"ping": str(cuerpo.get("ping", ""))}
+        if self.asincronico():
+            return self.dar_ticket("POST /echo", parametros)
         codigo, contenido, destino, detalle = derivar(
-            "POST /echo", {"ping": str(cuerpo.get("ping", ""))}, cliente=self.client_address[0])
+            "POST /echo", parametros, cliente=self.client_address[0])
         self.paso("POST /echo", codigo or 200, contenido, destino, detalle)
 
     def listar(self):
+        if self.asincronico():
+            return self.dar_ticket("GET /personas")
         codigo, contenido, destino, detalle = derivar("GET /personas",
                                                       cliente=self.client_address[0])
         if codigo:
@@ -659,9 +802,11 @@ class Manejador(BaseHTTPRequestHandler):
         # tiempo no sabemos si la creó, y repetirla puede duplicar la persona.
         # La cola respeta esta marca: un pedido no idempotente cuya reserva vence
         # se falla, no se reasigna.
+        parametros = {"nombre": str(cuerpo.get("nombre", "")), "legajo": legajo}
+        if self.asincronico():
+            return self.dar_ticket("POST /personas", parametros, idempotente=False)
         codigo, contenido, destino, detalle = derivar(
-            "POST /personas", {"nombre": str(cuerpo.get("nombre", "")), "legajo": legajo},
-            idempotente=False, cliente=self.client_address[0])
+            "POST /personas", parametros, idempotente=False, cliente=self.client_address[0])
         if codigo:
             return self.paso("POST /personas", codigo, contenido, destino, detalle)
         persona = contenido.get("persona") or {}
@@ -740,6 +885,8 @@ class ManejadorPublico(Manejador):
             self.salud()
         elif ruta == "/personas":
             self.listar()
+        elif ruta.startswith("/pedidos/"):
+            self.ver_ticket(ruta[len("/pedidos/"):])
         else:
             self.paso(f"GET {ruta}", 404, {"error": "no existe"}, None, None)
 
