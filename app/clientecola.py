@@ -23,6 +23,10 @@ class ErrorCola(Exception):
     """No se pudo hablar con el sistema de colas. Es distinto de que la cola
     conteste que está llena: eso es una respuesta, esto es que no hay nadie."""
 
+    def __init__(self, mensaje, enviado=False):
+        super().__init__(mensaje)
+        self.enviado = enviado
+
 
 class ClienteCola:
 
@@ -44,16 +48,15 @@ class ClienteCola:
         return self._pedir("POST", "/pedidos", pedido)
 
     def tomar_respuesta(self, destinatario, espera):
-        """La próxima respuesta para `destinatario`, o None si no hubo ninguna.
+        """La próxima respuesta para `destinatario`, como (codigo, datos).
 
         `espera` es un long-poll: la cola cuelga la conexión hasta que aparezca
         una respuesta o pasen esos segundos. El timeout de socket va más alto
         que la espera, o el cliente cortaría justo antes de que la cola conteste.
         """
-        codigo, datos = self._pedir("POST", "/respuestas/tomar",
-                                    {"destinatario": destinatario, "espera": espera},
-                                    timeout=espera + self.timeout)
-        return datos if codigo == 200 else None
+        return self._pedir("POST", "/respuestas/tomar",
+                           {"destinatario": destinatario, "espera": espera},
+                           timeout=espera + self.timeout)
 
     def estado(self):
         """El detalle de las dos colas, para /health. None si la cola no responde."""
@@ -121,7 +124,8 @@ class ClienteCola:
                 conexion.close()
                 if reusada:
                     continue        # conexión rancia: se descarta y se prueba otra
-                raise ErrorCola(f"{type(e).__name__}: {e}") from e
+                enviado = not isinstance(e, ConnectionRefusedError)
+                raise ErrorCola(f"{type(e).__name__}: {e}", enviado=enviado) from e
             self._guardar(conexion)
             if codigo == 204 or not datos:
                 return codigo, {}
@@ -129,4 +133,4 @@ class ClienteCola:
                 return codigo, json.loads(datos)
             except ValueError:
                 return codigo, {}
-        raise ErrorCola("todas las conexiones del pool fallaron")
+        raise ErrorCola("todas las conexiones del pool fallaron", enviado=False)

@@ -118,6 +118,40 @@ protobuf a JSON campo por campo; ahora el worker manda el `contenido` ya armado 
 balanceador sólo lo mete en el sobre. Agregar un campo a la app dejó de obligar a tocar acá.
 La forma de cada `contenido` está en [`cola/README.md`](cola/README.md#las-operaciones).
 
+### Sin quedarse esperando: `Prefer: respond-async`
+
+Por defecto el cliente espera su respuesta en la misma conexión, hasta `BA_PRESUPUESTO`. Si
+manda `Prefer: respond-async` (RFC 7240) en `GET /`, `POST /echo`, `GET /personas` o
+`POST /personas`, recibe en el acto un ticket y la retira después:
+
+```
+POST /personas   Prefer: respond-async
+← 202  Location: /pedidos/4b7b….1790058626   Retry-After: 1   Preference-Applied: respond-async
+   {"Code": 202, "contenido": {"id": "4b7b….1790058626", "estado": "pendiente"}}
+
+GET /pedidos/4b7b….1790058626
+← 202 {"estado": "pendiente"}               todavía en la cola: volver en Retry-After
+← 201 / 200 / 409 / 400 / 504 …             lo mismo que habría contestado sincrónico
+← 404                                       ticket mal formado o vencido
+```
+
+**El balanceador no guarda nada.** Cada pedido asincrónico se publica con su propio
+destinatario, `ticket:<id>`, así que la respuesta queda en la cola en una caja propia —la cola
+entrega por destinatario, no por id de pedido— y los recolectores no la ven. `GET /pedidos`
+la retira de esa caja. Consecuencias:
+
+- la respuesta está **replicada por Raft**: sobrevive a un cambio de master y a un reinicio
+  del balanceador, y la puede retirar cualquier balanceador;
+- sin nadie con una conexión abierta, el pedido puede esperar `BA_PRESUPUESTO_ASYNC` (60 s)
+  en vez de 5: lo que dure una caída de los workers;
+- **se entrega una sola vez**: retirarla la saca de la cola. Una segunda consulta dice
+  `pendiente` hasta que el ticket vence;
+- una caja vacía no distingue «todavía no» de «ya se retiró» o «la cola la descartó». Lo
+  único que se sabe sin guardar nada es la hora que lleva el ticket: pasados
+  `BA_PRESUPUESTO_ASYNC + BA_TTL_TICKET` ya no puede haber nada y es `404` sin preguntar.
+
+El uuid del ticket es imposible de adivinar: es la llave para leer la respuesta.
+
 ## Levantarlo
 
 **Son dos contenedores y la cola va primero.** Al revés, el balanceador arranca contestando
@@ -231,11 +265,36 @@ pueden estar cruzados y los dos casos son reales:
 | Registrada y sana, no consume | el contenedor vive y su worker no arrancó | `503` si es la única |
 | Cola caída | nadie atiende nada | `503` siempre |
 
-`replicasSanas` sigue saliendo, pero como información y no como veredicto: es lo que el CD
-mira después de un deploy. El campo nuevo es `replicasConsumiendo`, y es el que decide.
+Lleva sólo lo que necesita un cliente, y nada dos veces:
 
-La consola lo muestra como dos columnas separadas (`sano` y `consume`) justamente para que se
-vea cuándo no coinciden.
+```jsonc
+{"Code": 200, "contenido": {
+  "balanceador": "sano",                        // o "sin cola" / "sin réplicas consumiendo"
+  "casa": "casa-tomas",
+  "replicas": ["casa-a:8080", "casa-b:8080"],   // las que pidieron trabajo a la cola hace poco
+  "cola": {
+    "estado": "sana",                           // o "eligiendo" / "caída"
+    "encolados": 0, "enVuelo": 0, "cota": 100,
+    "nodos": [
+      {"url": "http://100.120.186.92:8085", "instancia": "cola-juan", "rol": "master", "termino": 124},
+      {"url": "http://100.91.134.43:8085", "instancia": "cola-salva", "rol": "slave", "termino": 124},
+      {"url": "http://100.78.246.64:8085", "rol": "caido"}      // sin nombre ni término: no contestó
+    ]}}}
+```
+
+**Cómo sabe qué réplicas andan.** El worker de cada réplica le pide trabajo a la cola
+(`POST /pedidos/tomar`) con su `host:puerto` como `consumidor`, y la cola anota cuándo lo
+vio por última vez. El balanceador lee eso de `GET /estado` de la cola y lista las que
+pidieron en los últimos `BA_UMBRAL_CONSUMO` segundos (45). El umbral tiene que ser mayor
+que el long-poll más largo de los workers (hasta 30 s): una réplica sana que espera trabajo
+no pide de nuevo hasta que se le vence la espera. La contracara es que **una réplica muerta
+sigue en la lista hasta que pasa el umbral**: la cola sabe cuándo pidió por última vez, no
+que se murió.
+
+**El registro del CD no sale en `/health`.** Qué réplicas conmutó el CD y si pasan el health
+gRPC (`sano`, `fallos`, `atendidos`) está en `GET /admin/backends`, en el puerto de control,
+que es donde lo lee el CD. La consola lo muestra en el menú 1, con las columnas `sano` y
+`consume` separadas justamente para que se vea cuándo no coinciden.
 
 ## Los dos planos
 
@@ -286,8 +345,8 @@ es exactamente el tipo de decisión que hay que poder defender en vivo.
 
 1. **Un salto de red más por pedido**, y un componente nuevo en el camino crítico.
 2. **Un punto único de falla nuevo:** sin cola no se atiende nada, aunque las cuatro réplicas
-   estén perfectas. Por eso `/health` contesta `503` con la cola caída aunque `replicasSanas`
-   sea 4 — mentir ahí sería peor.
+   estén perfectas. Por eso `/health` contesta `503` con la cola caída aunque las cuatro
+   pasen el health gRPC — mentir ahí sería peor.
 3. **La reasignación pasó a depender de un vencimiento**, no de un error. Antes el
    `UNAVAILABLE` del RPC era instantáneo; ahora hay que esperar `COLA_RESERVA` (2 s) para
    notar que una réplica se murió con el pedido en la mano. El presupuesto de 5 s deja lugar
@@ -301,8 +360,10 @@ es exactamente el tipo de decisión que hay que poder defender en vivo.
    destinatario y ninguno se lleva las del otro—, pero **la decisión de si van dos colas o una
    está abierta.**
 
-**Lo que no cambió:** el contrato con el cliente es sincrónico. El cliente hace
-`POST /personas` y espera su `201` en el mismo socket. Nada de tickets, `202` ni polling.
+**Lo que no cambió:** por defecto el contrato con el cliente es sincrónico. El cliente hace
+`POST /personas` y espera su `201` en el mismo socket. Los tickets existen, pero sólo para el
+que los pide con `Prefer: respond-async`: el verificador y los clientes que ya existían no
+notan nada.
 
 ## Reglas
 
@@ -422,6 +483,8 @@ Del balanceador:
 | `BA_ESPERA_RECOLECTOR` | `20` | Segundos de cada long-poll |
 | `BA_PRESUPUESTO` | `5` | Presupuesto total por pedido, espera en cola incluida |
 | `BA_GRACIA_COLA` | `1` | Margen sobre el presupuesto antes de rendirse solo |
+| `BA_PRESUPUESTO_ASYNC` | `60` | Presupuesto de un pedido con ticket. La cola lo topa en `COLA_PRESUPUESTO_MAXIMO` |
+| `BA_TTL_TICKET` | `60` | Tiene que ser el `COLA_TTL_RESPUESTAS` de los nodos: con eso se sabe cuándo un ticket venció |
 | `BA_BACKENDS` | *(vacío)* | Réplicas iniciales. `host:puerto` o `host:puerto=java` |
 | `BA_UMBRAL_CONSUMO` | `45` | Hace cuánto tiene que haber pedido trabajo una réplica para contarla como consumiendo. Mayor que el long-poll de los workers |
 | `BA_INTERVALO_SALUD` | `3` | Segundos entre chequeos de salud |

@@ -1,0 +1,96 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Python 3.13, gRPC (grpcio, protobuf), standard-library HTTP server.
+  Architecture: load balancer (sdypp_balanceador) as gRPC client to worker
+  replicas, decoupled from a standalone queue service (sdypp_colas_serv) that
+  now owns request/response queueing. Two-repository change: this repo hosts
+  SDD planning (openspec/); sdypp_colas_serv is a linked sibling repo split
+  from cola/ via git subtree.
+  Testing: stdlib unittest, no third-party test framework. Strict TDD enabled.
+  Style: Spanish domain names/comments in source, English SDD artifacts.
+
+strict_tdd: true
+
+repositories:
+  - name: sdypp_balanceador
+    role: primary / SDD planning home
+    path: /home/juan-cruz/Documents/UNLu/SD/tp-grupal/sdypp_balanceador
+    branch: feature/desacople
+    remote: git@github.com:SDyPPTpGrupal/sdypp_balanceador.git
+    stack: Python 3.13
+    dependencies: requirements.txt (grpcio==1.83.1, protobuf==7.36.1, grpcio-health-checking==1.83.1), requirements-build.txt (grpcio-tools==1.83.1, dev-only)
+    key_sources:
+      - app/balanceador.py
+      - app/clientecola.py
+      - app/verificador.py
+      - consola.py
+    test_command: "python -m unittest discover -s tests -v"
+    test_framework: unittest (stdlib)
+    test_layers: { unit: true, integration: partial (tests/test_servidor_cola.py, tests/test_colas.py exercise the queue over sockets), e2e: false }
+    coverage: { available: false, command: null }
+    quality_tools: { linter: null, type_checker: null, formatter: null }
+    notes: >
+      Test command requires grpcio/protobuf installed (per requirements.txt);
+      no virtualenv is currently provisioned in this environment. 3 of 6 test
+      modules (test_sobre, test_derivar, test_admin) import app.balanceador and
+      fail with ModuleNotFoundError: grpc until dependencies are installed.
+      Recommend: python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+      before running the suite.
+  - name: sdypp_colas_serv
+    role: secondary / standalone queue service (new, seeded via git subtree split from cola/)
+    path: /home/juan-cruz/Documents/UNLu/SD/tp-grupal/sdypp_colas_serv
+    branch: feature/desacople
+    remote: git@github.com:SDyPPTpGrupal/sdypp_colas_serv.git
+    stack: Python 3.13, standard library only (no pip install in Docker image)
+    dependencies: none (stdlib only, by design)
+    key_sources:
+      - colas.py
+      - servidor.py
+      - Dockerfile
+      - README.md
+    test_command: null
+    test_framework: null
+    test_layers: { unit: false, integration: false, e2e: false }
+    coverage: { available: false, command: null }
+    quality_tools: { linter: null, type_checker: null, formatter: null }
+    notes: >
+      No tests/ directory exists yet in this repo. Strict TDD for changes
+      scoped to this repo requires establishing a stdlib-unittest test command
+      here first (consistent with the "standard library only" constraint —
+      no pytest). Any tooling recorded for this repo must not require pip
+      install inside the Docker image.
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes, especially anything touching
+      the balanceador <-> colas queue boundary (network/API contract).
+    - State explicitly which repository (or both) a proposal affects.
+  specs:
+    - Use Given/When/Then for scenarios.
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY).
+    - Keep balanceador and colas_serv behavior contracts in separate domains
+      when a change spans both repos.
+  design:
+    - Include sequence diagrams for cross-repo request/response flows.
+    - Document architecture decisions with rationale.
+  tasks:
+    - Group by phase, use hierarchical numbering.
+    - Keep tasks completable in one session.
+    - Tag each task with the repository it applies to (balanceador and/or colas_serv).
+  apply:
+    guidelines:
+      - Follow existing code patterns (Spanish domain naming, existing module layout).
+      - Never introduce third-party dependencies into sdypp_colas_serv (stdlib only).
+    tdd: true
+    test_command: "python -m unittest discover -s tests -v"
+    test_command_notes: >
+      Applies to sdypp_balanceador only; sdypp_colas_serv has no test suite yet.
+      Strict TDD tasks touching sdypp_colas_serv must first add a stdlib
+      unittest-based test command for that repo.
+  verify:
+    test_command: "python -m unittest discover -s tests -v"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas.

@@ -29,7 +29,10 @@ WORKDIR /app
 RUN useradd --create-home --uid 1000 balanceador
 
 COPY --from=builder /instalado /usr/local
-COPY app/balanceador.py app/clientecola.py ./
+# Los tres módulos del balanceador. `clientereplica.py` es el que rutea contra
+# el clúster de colas y `clientecola.py` el transporte que usa por debajo:
+# sin el primero la imagen ni siquiera importa.
+COPY app/balanceador.py app/clientecola.py app/clientereplica.py ./
 
 RUN mkdir -p /app/logs && chown -R balanceador:balanceador /app
 USER balanceador

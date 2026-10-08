@@ -63,12 +63,20 @@ class ColaFalsa:
         with self._hay:
             while not self._respuestas:
                 if time.monotonic() >= limite:
-                    return None
+                    return 204, {}
                 self._hay.wait(timeout=0.05)
-            return self._respuestas.popleft()
+            return 200, self._respuestas.popleft()
 
     def estado(self):
         return None if self.caida else self.estado_falso
+
+    def master_conocido(self):
+        return None if self.caida else self.url
+
+    def instancias(self):
+        if self.caida:
+            return [{"url": self.url, "instancia": "cola-falsa", "rol": "caido", "termino": 0}]
+        return [{"url": self.url, "instancia": "cola-falsa", "rol": "master", "termino": 1}]
 
     # -- lo que hace de worker en las pruebas --
 
